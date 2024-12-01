@@ -75,11 +75,11 @@ To force the bug:
 
 Now, instead of chossing sensible move index $12 (18 decimal), it chooses move index $0d (low byte of address $BF0D) which translates to the weird move G7-G5 and the link to the next entry is unpredictable as it now points outside of the book table! In fact, while the computer thinks he's playing by the book, you can do stuff like H2-H4, to which the computer responds with an E7-E5 and allows you to capture the pawn H4xG5:
 
-![Bug in VIC-20 openings table](img/openings_sargon2_vic20_bug_mini.png)
+![Bug in VIC-20 openings table](IMG/openings_sargon2_vic20_bug_mini.png)
 
 When you do the same using Sargon 2.1's openings book, the computer actually plays move $12 (G8-F6):
 
-![Bug in CP/M openings table](img/openings_sargon2_vic20_fix_mini.png)
+![Bug in CP/M openings table](IMG/openings_sargon2_vic20_fix_mini.png)
 
 The openings table is extracted from the [CP/M version of Sargon 2.1](https://www.icl1900.co.uk/unix4fun/z80pack/ftp/chess.tgz):
 
