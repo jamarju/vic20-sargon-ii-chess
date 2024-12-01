@@ -2,9 +2,9 @@ This is Sargon II Chess for the Commodore VIC-20 relocated to RAM ($2000) so tha
 
 Game functionality, openings table, bugs (shifted intro screen?), etc. are preserved as in the original.
 
-**NEW 2024-12-01**: An enhanced version including Sargon 2.1 CP/M version of the openings book is now also available!
-
 The only change is that `RESTORE` will bring you to the intro screen in addition to the original combination (`RUN/STOP` + `RESTORE`).
+
+**NEW 2024-12-01**: An enhanced version including Sargon 2.1 CP/M version of the openings book is now also available!
 
 ## Requirements (MacOs)
 
@@ -25,7 +25,7 @@ Get exomizer binary from: http://www.popelganda.de/relaunch64.html (tested versi
 ## Pre-compiled versions
 
 - `PRG/SargonII-2000-vic-book.prg` is the original version with buggy openings table (see discussion below). Needs 8KB expansion (block 1 from $2000-$3fff).
-- `PRG/SargonII-2000-cpm-book.prg` is the fixed version with CP/M openings table. Because of the extended openings book size, this version needs 16KB expansion (blocks 1 and 2 from $2000-$5fff).
+- `PRG/SargonII-2000-cpm-book.prg` is the fixed version with Sargon 2.1 CP/M openings table. Because of the extended openings book size, this version needs 16KB expansion (blocks 1 and 2 from $2000-$5fff).
 
 ## Openings bug
 
@@ -44,7 +44,7 @@ The openings book entry for blacks after whites play first move C2-C4 is corrupt
         .word   @TBF0D
 ```
 
-By contrast, this is the same entry in the CP/M version:
+By contrast, this is the same entry in Sargon 2.1:
 
 ```
 @L347A: .byte   $1B
@@ -66,8 +66,8 @@ To force the bug:
 - Load Vice (xvic) from it
 - "Connect" if not done already
 - On the breakpoints tab, enter a breakpoint (type: "Break") just before the VIC raster line is read:
-    - $3fa5 (VIC-20 openings version)
-    - $4461 (CP/M openings version)
+    - $3fa5 (Sargon 2 original openings version)
+    - $4461 (with Sargon 2.1 openings)
 - Run the program, choose whites, play your first move: C2-C4.
 - The program will break just before the VIC raster line is read.
 - F10 to step through reading the scanline.
@@ -77,7 +77,7 @@ Now, instead of chossing sensible move index $12 (18 decimal), it chooses move i
 
 ![Bug in VIC-20 openings table](img/openings_sargon2_vic20_bug_mini.png)
 
-When you do the same in the CP/M openings book, the computer actually plays move $12 (G8-F6):
+When you do the same using Sargon 2.1's openings book, the computer actually plays move $12 (G8-F6):
 
 ![Bug in CP/M openings table](img/openings_sargon2_vic20_fix_mini.png)
 
