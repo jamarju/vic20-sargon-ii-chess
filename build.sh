@@ -1,7 +1,11 @@
+#!/bin/bash -e
+
 f=SargonII.S
 a=2000
 
-# -t none need so that upper case chars are not auto translated to hi ascii
-cl65 -d -t none -o SargonII-raw-$a.prg -C vic20-asm.cfg "$f" -t vic20 --start-addr 0x$a
+# -t none needed so that upper case chars are not auto translated to hi ascii
+cl65 -l PRG/SargonII-raw-$a-vic-book.lst -d -t none -o PRG/SargonII-raw-$a-vic-book.prg -C vic20-asm.cfg --asm-args -DUSE_VIC_BOOK "$f" -t vic20 --start-addr 0x$a
+cl65 -l PRG/SargonII-raw-$a-cpm-book.lst -d -t none -o PRG/SargonII-raw-$a-cpm-book.prg -C vic20-asm.cfg --asm-args -DUSE_CPM_BOOK "$f" -t vic20 --start-addr 0x$a
 
-exomizer sfx 8192 -t 52 -x1 SargonII-raw-$a.prg -o SargonII-$a.prg
+exomizer sfx 8192 -t 52 -x1 PRG/SargonII-raw-$a-vic-book.prg -o PRG/SargonII-$a-vic-book.prg
+exomizer sfx 8192 -t 52 -x1 PRG/SargonII-raw-$a-cpm-book.prg -o PRG/SargonII-$a-cpm-book.prg
