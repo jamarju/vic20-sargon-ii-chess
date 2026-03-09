@@ -1,26 +1,88 @@
-; Assembler: cc65 v2.17.0
-; 6502bench SourceGen v1.0.0
+; =====================================================================
+; SARGON II CHESS - VIC-20 Disassembly
+; =====================================================================
+; Original: Dan & Kathe Spracklen, (C) 1979 Hayden Book Co., Inc.
+; Adapted for VIC-20 by Andy Finkel
+; Disassembly: 6502bench SourceGen v1.0.0
+; Assembler: cc65 v2.17.0 (ca65/ld65)
+;
+; Memory Map:
+;   $0000-$00FF  Zero page variables (game state, temp regs)
+;   $033C-$0341  Input buffer (6 chars max)
+;   $0200-$0205  Joystick move buffer
+;   $1000-$101A  Principal variation / best move line
+;   $12FE-$131B  Move history stack (last 12 moves, 2 bytes each)
+;   $1319-$1327  Exchange evaluation table (SEE)
+;   $1327-$133B  Per-ply captured piece / move flags
+;   $133B-$1345  Per-ply move index
+;   $1346-$13C5  Attack table (pieces attacking each square)
+;   $13C6-$1445  Defend table (pieces defending each square)
+;   $1445-$146D  Per-ply best from/to squares
+;   $146E-$14E5  Board array (10x12 mailbox)
+;   $1A00-$1BFF  Custom character set
+;   $1E00-$1FF5  Screen RAM (22x23)
+;   $9600-$97F5  Color RAM
+;
+; Board Array ($146E, 10x12 mailbox):
+;   Squares $15-$62 are the 8x8 board (rows of 10, 2 border cols)
+;   $FF = border/invalid, $00 = empty
+;   Piece encoding: bit 7 = color (0=white, 1=black)
+;                   bit 6 = has-moved flag
+;                   bits 2-0 = type (1=P, 2=N, 3=B, 4=R, 5=Q, 6=K)
+;
+; Key Zero Page Variables:
+;   $07-$08   From/to square (temp), board cursor
+;   $0B-$0C   From/to square (current move)
+;   $0D       Move flags / piece type temp
+;   $0E       Captured piece temp
+;   $13       Current piece (full byte from board)
+;   $15       Human color (0=white, $80=black)
+;   $16       Next color to move (0=white, $80=black)
+;   $17       Ply depth (next_color+1)
+;   $18       Move number
+;   $19       Search depth level (0-6)
+;   $1A       Max search depth (level+1)
+;   $1B       Endgame flag (level+2)
+;   $1E       Positional evaluation accumulator
+;   $61-$62   Score (lo/hi) at current node
+;   $6A       Material balance (positive = white ahead)
+;   $6B       Pawn structure score
+;   $6C       White king position (board index)
+;   $6D       Black king position (board index)
+;   $8B-$8C   Move list pointer (lo/hi)
+;   $8D       Current move index in move list
+;   $8E-$8F   Move list end pointer (lo/hi)
+;
+; ".byte $2c" Trick:
+;   Throughout the code, ".byte $2c" (opcode for BIT abs) is used to
+;   skip the next 2-byte instruction. When execution falls through,
+;   the BIT instruction harmlessly reads an absolute address (the next
+;   two bytes), effectively skipping them. This saves a JMP instruction.
+; =====================================================================
+
          .setcpu "6502"
-human_color =    $15
-next_color =     $16
-move_number =    $18
-level    =       $19
-scoreL_stack =   $23
-scoreH_stack =   $30
-opening_ptr =   $94
-screen_page =    $0288
-nmi_vector_l =   $0318
-nmi_vector_h =   $0319
-vic_raster =     $9004
-b_init_ram =     $e3a4
-b_init_vecs =    $e45b
-b_init_hw =      $e518
-k_ramtas =       $fd8d
-k_init_regs =    $fdf9
-k_init_vecs =    $ff8a
-k_out_to_channel = $ffd2
-k_getchar =      $ffe4
-k_cursor_pos =   $fff0
+
+; --- Zero page and system equates ---
+human_color =    $15            ; human's piece color (0=white, $80=black)
+next_color =     $16            ; side to move (0=white, $80=black)
+move_number =    $18            ; current full-move number
+level    =       $19            ; search depth setting (0-6)
+scoreL_stack =   $23            ; score low bytes (indexed by ply)
+scoreH_stack =   $30            ; score high bytes (indexed by ply)
+opening_ptr =   $94             ; pointer into opening book (2 bytes)
+screen_page =    $0288          ; screen memory page register
+nmi_vector_l =   $0318          ; NMI vector low byte
+nmi_vector_h =   $0319          ; NMI vector high byte
+vic_raster =     $9004          ; VIC raster counter (used as RNG seed)
+b_init_ram =     $e3a4          ; BASIC ROM: init RAM
+b_init_vecs =    $e45b          ; BASIC ROM: init vectors
+b_init_hw =      $e518          ; BASIC ROM: init hardware
+k_ramtas =       $fd8d          ; KERNAL: RAM test and set
+k_init_regs =    $fdf9          ; KERNAL: init I/O registers
+k_init_vecs =    $ff8a          ; KERNAL: init vectors
+k_out_to_channel = $ffd2        ; KERNAL: output char to channel (CHROUT)
+k_getchar =      $ffe4          ; KERNAL: get character (GETIN)
+k_cursor_pos =   $fff0          ; KERNAL: set cursor position
 
          .org    $2000          ; original $a000
 
@@ -46,45 +108,54 @@ k_cursor_pos =   $fff0
 .endif
 ;--- END OF ORIGINAL ---
 
-LA009:   lda     #$93
+; =====================================================================
+; I/O AND SCREEN ROUTINES
+; =====================================================================
+
+; Clear screen via KERNAL CHROUT ($93 = clear screen char)
+clear_screen:   lda     #$93
          jmp     k_out_to_channel
 
-LA00E:   jsr     LA019
-LA011:   clc
+; Clear screen, fill RAM, and home cursor to board origin (col 7, row 6)
+clear_and_home:   jsr     clear_screen_fill
+home_cursor:   clc
          ldx     #$07
          ldy     #$06
          jmp     k_cursor_pos
 
-LA019:   jsr     LA009
+; Clear screen and fill screen+color RAM with spaces ($A0)
+clear_screen_fill:   jsr     clear_screen
          lda     #$a0
          ldx     #$fd
-@LA020:  sta     $1dff,x
+@fill_loop:  sta     $1dff,x
          sta     $1efc,x
          dex
-         bne     @LA020
+         bne     @fill_loop
          rts
 
-LA02A:   pha
+; Scroll the status bar area (5 chars wide, 16 rows) down by one line
+; Preserves A on stack. Source/dest ptrs in $57-$5C.
+draw_status_bar:   pha
          ldx     #$03
-@LA02D:  lda     @LA06A,x
+@load_ptrs:  lda     @ptr_data,x
          sta     $57,x
          dex
-         bpl     @LA02D
+         bpl     @load_ptrs
          ldx     #$0f
-@LA037:  ldy     #$00
+@row_loop:  ldy     #$00
          lda     $57
          sta     $5b
          clc
          lda     $58
          adc     #$78
          sta     $5c
-@LA044:  lda     ($59),y
+@col_loop:  lda     ($59),y
          sta     ($57),y
          lda     #$01
          sta     ($5b),y
          iny
          cpy     #$05
-         bcc     @LA044
+         bcc     @col_loop
          lda     $5a
          sta     $58
          lda     $59
@@ -92,110 +163,120 @@ LA02A:   pha
          clc
          adc     #$16
          sta     $59
-         bcc     @LA062
+         bcc     @no_carry
          inc     $5a
-@LA062:  dex
-         bne     @LA037
-         jsr     LA06E
+@no_carry:  dex
+         bne     @row_loop
+         jsr     clear_input_line
          pla
          rts
 
-@LA06A:  .byte   $11
+@ptr_data:  .byte   $11
          .byte   $1e
          .byte   $27
          .byte   $1e
 
-LA06E:   ldy     #$04
-@LA070:  lda     #$60
+; Clear the 5-char input display line at $1F5B with spaces ($60)
+clear_input_line:   ldy     #$04
+@clr_loop:  lda     #$60
          sta     $1f5b,y
          lda     #$01
          sta     $975b,y
          dey
-         bpl     @LA070
+         bpl     @clr_loop
          rts
 
-LA07E:   lda     #$0f
+; Flash the board 15 times (visual feedback for game events)
+flash_board:   lda     #$0f
          sta     $00
-@LA082:  jsr     LA09E
+@flash_loop:  jsr     redraw_status
          dec     $00
-         bne     @LA082
+         bne     @flash_loop
          rts
 
-LA08A:   ldx     $f9
-         cmp     #$0d
-         beq     LA09E
+; Put a character to the input display area
+; Input: A = character; $F9 = current cursor position
+put_char:   ldx     $f9
+         cmp     #$0d            ; carriage return?
+         beq     redraw_status
          inx
          cpx     #$06
-         bcc     @LA098
-         jsr     LA09E
-@LA098:  jmp     LA152
+         bcc     @show_it
+         jsr     redraw_status
+@show_it:  jmp     show_input_char
 
-LA09B:   jsr     LAD12
-LA09E:   jsr     LA02A
+print_and_redraw:   jsr     print_string_xy
+redraw_status:   jsr     draw_status_bar
          ldx     #$00
          stx     $f9
          rts
 
-LA0A6:   ldx     #$00
+; Get a line of input from keyboard (up to 5 chars)
+; Returns: first char in A, full buffer at $033C
+; $F9 = cursor pos, $1F = input mode flags (bit 7 = joystick)
+get_input:   ldx     #$00
          stx     $f9
          stx     $1f
-LA0AC:   ldx     #$00
+get_input_reset:   ldx     #$00
          stx     $00
-LA0B0:   jsr     LA0F6
+get_input_loop:   jsr     poll_keyboard
          pha
          lda     $f9
-         bne     @LA0BB
-         jsr     LA06E
-@LA0BB:  jsr     LA3F9
+         bne     @redraw
+         jsr     clear_input_line
+@redraw:  jsr     draw_board_frame
          pla
          bit     $1f
-         bpl     @LA0C6
-         jmp     LA172
+         bpl     @check_key
+         jmp     joystick_input
 
-@LA0C6:  cmp     #$0d
-         bcc     LA0B0
+@check_key:  cmp     #$0d
+         bcc     get_input_loop
          cmp     #$4a
-         bcs     LA0B0
+         bcs     get_input_loop
          cmp     #$14
-         beq     LA0ED
+         beq     handle_delete
          cmp     #$0d
-         beq     @LA0E2
+         beq     @enter_key
          ldy     $00
          cpy     #$05
-         bcs     LA0B0
-         jsr     LA125
-         jmp     LA0B0
+         bcs     get_input_loop
+         jsr     store_input_char
+         jmp     get_input_loop
 
-@LA0E2:  jsr     LA12C
-LA0E5:   ldx     #$00
+@enter_key:  jsr     update_input_cursor
+get_input_done:   ldx     #$00
          stx     $f9
          lda     $033c
          rts
 
-LA0ED:   jsr     LA12C
+handle_delete:   jsr     update_input_cursor
          dec     $00
-         bmi     LA0AC
-         bpl     LA0B0
+         bmi     get_input_reset
+         bpl     get_input_loop
 
-LA0F6:   jsr     k_getchar
-         bne     @LA105
-         jsr     LA1CF
-         beq     LA0F6
-         lda     #$80
+; Poll keyboard and joystick for input
+; Returns: key code in A. Sets $1F bit 7 if joystick used.
+; '?' key triggers hint_move directly.
+poll_keyboard:   jsr     k_getchar
+         bne     @check_hint
+         jsr     read_joystick    ; no key: check joystick
+         beq     poll_keyboard
+         lda     #$80             ; flag: input from joystick
          sta     $1f
-@LA104:  rts
+@done:  rts
 
-@LA105:  cmp     #$3f
-         bne     @LA104
-         jmp     LAD38
+@check_hint:  cmp     #$3f
+         bne     @done
+         jmp     hint_move
 
-LA10C:   jsr     k_getchar
-         beq     LA10C
+wait_keypress:   jsr     k_getchar
+         beq     wait_keypress
          rts
 
 input:   jsr     input_string
-         jsr     LA10C
-LA118:   pha
+         jsr     wait_keypress
+echo_char_cr:   pha
          ora     #$80
          jsr     k_out_to_channel
          lda     #$0d
@@ -203,34 +284,34 @@ LA118:   pha
          pla
          rts
 
-LA125:   ldy     $00
+store_input_char:   ldy     $00
          inc     $00
          sta     $033c,y
-LA12C:   ldx     $f9
+update_input_cursor:   ldx     $f9
          cmp     #$14
-         beq     @LA13C
+         beq     @del_char
          cmp     #$0d
-         beq     @LA14D
+         beq     @reset_pos
          inx
          cpx     #$06
-         bcc     LA152
+         bcc     show_input_char
          rts
 
-@LA13C:  lda     #$60
+@del_char:  lda     #$60
          cpx     #$00
-         beq     @LA14D
+         beq     @reset_pos
          sta     $1f5a,x
          dex
-         beq     @LA14A
-         bmi     @LA14D
-@LA14A:  stx     $f9
+         beq     @save_pos
+         bmi     @reset_pos
+@save_pos:  stx     $f9
          rts
 
-@LA14D:  ldx     #$00
+@reset_pos:  ldx     #$00
          stx     $f9
          rts
 
-LA152:   stx     $f9
+show_input_char:   stx     $f9
          ora     #$40
          sta     $1f5a,x
          pha
@@ -239,180 +320,201 @@ LA152:   stx     $f9
          pla
          rts
 
-LA161:   stx     $900b
+; Produce a beep sound. X = pitch value for VIC sound register.
+beep:   stx     $900b
          ldx     #$80
          ldy     #$80
-@LA168:  dex
-         bne     @LA168
+@delay:  dex
+         bne     @delay
          dey
-         bne     @LA168
+         bne     @delay
          sty     $900b
          rts
 
-LA172:   ldx     #$36
-@LA174:  stx     $07
-@LA176:  jsr     LA210
-         jsr     LA1CF
-         beq     @LA176
+; Joystick-based move input: navigate board cursor, fire to select squares
+; Builds from/to move in $0200 buffer, then copies to $033C input buffer
+joystick_input:   ldx     #$36
+@set_square:  stx     $07
+@wait_joy:  jsr     joy_highlight_sq
+         jsr     read_joystick
+         beq     @wait_joy
          cmp     #$0d
-         beq     @LA188
-         jsr     LA225
-         jmp     @LA174
+         beq     @enter_move
+         jsr     joy_move_cursor
+         jmp     @set_square
 
-@LA188:  ldx     #$dc
-         jsr     LA161
+@enter_move:  ldx     #$dc
+         jsr     beep
          lda     $ab
          clc
          adc     #$41
-         jsr     @LA1C5
+         jsr     @store_char
          lda     $ac
          eor     #$07
          clc
          adc     #$31
-         jsr     @LA1C5
+         jsr     @store_char
          lda     $1f
          and     #$01
-         bne     @LA1B0
+         bne     @copy_move
          lda     #$2d
-         jsr     @LA1C5
+         jsr     @store_char
          lda     #$81
          sta     $1f
-         bne     @LA176
+         bne     @wait_joy
 
-@LA1B0:  ldx     #$05
-@LA1B2:  lda     $0200,x
+@copy_move:  ldx     #$05
+@copy_loop:  lda     $0200,x
          sta     $033c,x
          dex
-         bpl     @LA1B2
-@LA1BB:  jsr     LA1CF
-         bne     @LA1BB
+         bpl     @copy_loop
+@wait_release:  jsr     read_joystick
+         bne     @wait_release
          sta     $1f
-         jmp     LA0E5
+         jmp     get_input_done
 
-@LA1C5:  ldy     $00
+@store_char:  ldy     $00
          inc     $00
          sta     $0200,y
-         jmp     LA12C
+         jmp     update_input_cursor
 
-LA1CF:   sei
-         ldx     #$7f
+; Read joystick via VIA registers
+; Returns: 0 = no input, $0D = fire, $91/$11/$9D/$1D = directions
+read_joystick:   sei
+         ldx     #$7f             ; set VIA port A DDR for read
          stx     $9122
-@LA1D5:  lda     $9120
+@debounce:  lda     $9120           ; debounce: read until stable
          cmp     $9120
-         bne     @LA1D5
-         ldx     #$ff
+         bne     @debounce
+         ldx     #$ff             ; restore VIA port A DDR
          stx     $9122
-         ldx     #$f7
+         ldx     #$f7             ; set keyboard scan column
          stx     $9120
          cli
-         and     #$80
-         bne     @LA1EF
+         and     #$80             ; check fire button (active low)
+         bne     @read_col
+; ".byte $2c" trick: LDA #$1D / RTS - returns $1D (right) if fire pressed
+; But bit 7 clear means fire, so we get LDA #$1D then RTS
+         .byte   $a9              ; LDA #imm (skip next 2 bytes)
+         .byte   $1d              ; value: right cursor
+         .byte   $60              ; RTS opcode
 
-         .byte   $a9
-         .byte   $1d
-         .byte   $60
-
-@LA1EF:  ldy     $9111
+@read_col:  ldy     $9111
          cpy     $9111
-         bne     @LA1EF
+         bne     @read_col
          ldx     #$04
-@LA1F9:  tya
-         and     @LA206,x
-         beq     @LA202
+@scan_dirs:  tya
+         and     @dir_masks,x
+         beq     @found_dir
          dex
-         bpl     @LA1F9
-@LA202:  lda     @LA20B,x
+         bpl     @scan_dirs
+@found_dir:  lda     @dir_keys,x
          rts
 
-@LA206:  .byte   $00
+@dir_masks:  .byte   $00
          .byte   $04
          .byte   $08
          .byte   $10
          .byte   $20
-@LA20B:  .byte   $00
+@dir_keys:  .byte   $00
          .byte   $91
          .byte   $11
          .byte   $9d
          .byte   $0d
 
-LA210:   lda     $07
-         jsr     LA311
+; =====================================================================
+; DISPLAY AND GRAPHICS
+; =====================================================================
+
+; Flash the square at board index $07 (for joystick cursor)
+joy_highlight_sq:   lda     $07
+         jsr     index_to_coords
          lda     $033c
          sta     $ab
          lda     $033d
          sta     $ac
          lda     #$02
-         jsr     LA25E
+         jsr     flash_square_n
          rts
 
-LA225:   ldy     #$08
+; Move board cursor based on joystick direction
+; A = key code ($9D=left, $1D=right, $91=down, $11=up)
+; X = board index delta, Y = wrap-around delta
+joy_move_cursor:   ldy     #$08
          ldx     #$ff
          cmp     #$9d
-         beq     @LA248
+         beq     @apply_dir
          ldy     #$f8
          ldx     #$01
          cmp     #$1d
-         beq     @LA248
+         beq     @apply_dir
          ldy     #$b0
          ldx     #$0a
          cmp     #$91
-         beq     @LA248
+         beq     @apply_dir
          ldy     #$50
          ldx     #$f6
          cmp     #$11
-         beq     @LA248
+         beq     @apply_dir
          ldy     #$ff
          rts
 
-@LA248:  txa
+@apply_dir:  txa
          clc
          adc     $07
          tax
          lda     $146e,x
          cmp     #$ff
-         bne     @LA25B
+         bne     @done
          sty     $07
          txa
          clc
          adc     $07
          tax
-@LA25B:  rts
+@done:  rts
 
-LA25C:   lda     #$10
-LA25E:   sta     $a8
-@LA260:  jsr     LA3B2
+; Flash a square N times. flash_square_16 enters with N=16.
+; $AB/$AC = file/rank coordinates of square to flash
+flash_square_16:   lda     #$10
+flash_square_n:   sta     $a8
+@flash_loop:  jsr     invert_square
          ldy     #$30
-@LA265:  dex
-         bne     @LA265
+@delay:  dex
+         bne     @delay
          dey
-         bne     @LA265
+         bne     @delay
          dec     $a8
-         bne     @LA260
+         bne     @flash_loop
          rts
 
-LA270:   jsr     LA25C
+; Animate a piece moving from ($AB,$AC) to ($AD,$AE)
+; $AA = piece code at destination (0 = empty after move)
+animate_move:   jsr     flash_square_16
          clc
          lda     $ab
          adc     $ac
          and     #$01
-         beq     @LA27E
+         beq     @set_bg
          lda     #$80
-@LA27E:  sta     $a9
-         jsr     LA386
+@set_bg:  sta     $a9
+         jsr     draw_empty_square
          lda     $ad
          sta     $ab
          lda     $ae
          sta     $ac
          lda     $aa
-         beq     @LA295
-         jsr     LA296
-         jsr     LA25C
-@LA295:  rts
+         beq     @done
+         jsr     draw_piece
+         jsr     flash_square_16
+@done:  rts
 
-LA296:   lda     $aa
+; Draw a piece at coordinates ($AB,$AC)
+; $AA = piece code (bits 0-2=type, bit 7=color, bit 6=has-moved)
+; Determines square color (light/dark) and piece glyph index
+draw_piece:   lda     $aa
          and     #$bf
          sta     $a7
-         beq     @LA2C0
+         beq     @set_bg
          rol     A
          rol     A
          and     #$01
@@ -428,39 +530,41 @@ LA296:   lda     $aa
          ora     $a9
          sta     $a5
          lda     $a7
-         bmi     @LA2BE
+         bmi     @black_bg
          lda     #$00
-         beq     @LA2C0
+         beq     @set_bg
 
-@LA2BE:  lda     #$80
-@LA2C0:  sta     $a9
+@black_bg:  lda     #$80
+@set_bg:  sta     $a9
          lda     $a7
-         bne     @LA2D7
+         bne     @draw_it
          lda     #$01
          sta     $a5
          clc
          lda     $ab
          adc     $ac
          and     #$01
-         beq     @LA2D5
+         beq     @set_bg2
          lda     #$80
-@LA2D5:  sta     $a9
-@LA2D7:  jsr     LA38A
+@set_bg2:  sta     $a9
+@draw_it:  jsr     draw_piece_glyph
          rts
 
-LA2DB:   lda     $aa
+; Convert piece encoding to glyph table index
+; Maps piece type (bits 0-2) to glyph index, preserving color in bit 7
+rotate_piece_enc:   lda     $aa
          rol     A
          php
          ror     A
          and     #$07
          tax
-         lda     @LA2EB,x
+         lda     @glyph_map,x
          plp
          ror     A
          sta     $aa
          rts
 
-@LA2EB:  .byte   $00
+@glyph_map:  .byte   $00
          .byte   $02
          .byte   $06
          .byte   $08
@@ -468,22 +572,27 @@ LA2DB:   lda     $aa
          .byte   $0a
          .byte   $0c
 
-LA2F2:   lda     $07
-         jsr     LA311
+; Parse board indices $07 (from) and $08 (to) into screen coordinates
+; Output: $AB/$AC = from file/rank, $AD/$AE = to file/rank
+parse_move_coords:   lda     $07
+         jsr     index_to_coords
          lda     $033c
          sta     $ab
          lda     $033d
          sta     $ac
          lda     $08
-         jsr     LA311
+         jsr     index_to_coords
          lda     $033c
          sta     $ad
          lda     $033d
          sta     $ae
          rts
 
-LA311:   ldx     #$01
-         jsr     LAB47
+; Convert board array index (A) to file/rank coordinates
+; Divides by 10 to get rank, mod 10 for file. Adjusts for display.
+; Output: $033C = file (0-7), $033D = rank (1-8)
+index_to_coords:   ldx     #$01
+         jsr     byte_to_decimal
          dec     $033c
          lda     $033c
          and     #$07
@@ -494,26 +603,30 @@ LA311:   ldx     #$01
          sta     $033d
          rts
 
-LA32B:   ldx     $08
+; Animate a piece moving from square $07 to square $08 on the display
+animate_piece:   ldx     $08
          lda     $146e,x
          sta     $aa
-         jsr     LA2F2
-         jsr     LA2DB
-         jsr     LA270
+         jsr     parse_move_coords
+         jsr     rotate_piece_enc
+         jsr     animate_move
          rts
 
-LA33C:   lda     #$00
+; Calculate screen RAM address for board square ($AB,$AC)
+; Screen RAM base = $1E00, each row = 22 bytes, each square = 2 chars wide
+; Output: $A3/$A4 = screen addr, $F7/$F8 = color addr, Y=1, X=2
+calc_screen_addr:   lda     #$00
          sta     $a3
          sta     $a4
          lda     $ac
          asl     A
          asl     A
-         jsr     LA377
+         jsr     add_offset_addr
          lda     $a3
          ldx     #$0a
-@LA34D:  jsr     LA377
+@mul_loop:  jsr     add_offset_addr
          dex
-         bne     @LA34D
+         bne     @mul_loop
          lda     #$00
          clc
          adc     $a3
@@ -523,12 +636,12 @@ LA33C:   lda     #$00
          sta     $a4
          lda     $ab
          asl     A
-         jsr     LA377
+         jsr     add_offset_addr
          ldy     #$01
          ldx     #$02
          rts
 
-LA36B:   lda     $a3
+calc_color_addr:   lda     $a3
          sta     $f7
          clc
          lda     $a4
@@ -536,26 +649,30 @@ LA36B:   lda     $a3
          sta     $f8
          rts
 
-LA377:   pha
+add_offset_addr:   pha
          clc
          adc     $a3
          sta     $a3
-         bcc     @LA381
+         bcc     @no_carry
          inc     $a4
-@LA381:  jsr     LA36B
+@no_carry:  jsr     calc_color_addr
          pla
          rts
 
-LA386:   lda     #$01
+; Draw an empty square (enters with glyph index 1 = blank 2x2 tile)
+draw_empty_square:   lda     #$01
          sta     $a5
-LA38A:   jsr     LA33C
+; Draw a piece glyph at screen coords ($AB,$AC)
+; $A5 = glyph index (x4 = offset into piece_glyphs table)
+; $A9 = background mask (0=light square, $80=dark square)
+draw_piece_glyph:   jsr     calc_screen_addr
          lda     $a5
          asl     A
          asl     A
          stx     $a5
          tax
          dex
-@LA395:  lda     LA528,x
+@draw_loop:  lda     piece_glyphs,x
          eor     $a9
          eor     #$80
          sta     ($a3),y
@@ -563,79 +680,82 @@ LA38A:   jsr     LA33C
          sta     ($f7),y
          dex
          dey
-         bpl     @LA395
+         bpl     @draw_loop
          ldy     #$01
          lda     #$16
-         jsr     LA377
+         jsr     add_offset_addr
          dec     $a5
-         bne     @LA395
+         bne     @draw_loop
          rts
 
-LA3B2:   jsr     LA33C
-@LA3B5:  lda     ($a3),y
+; Invert (flash) a square by XORing screen bytes with $80
+invert_square:   jsr     calc_screen_addr
+@inv_loop:  lda     ($a3),y
          eor     #$80
          sta     ($a3),y
          dey
-         bpl     @LA3B5
+         bpl     @inv_loop
          ldy     #$01
-         jsr     LA3C7
+         jsr     advance_row
          dex
-         bne     @LA3B5
+         bne     @inv_loop
          rts
 
-LA3C7:   pha
+advance_row:   pha
          lda     #$16
-         jsr     LA377
+         jsr     add_offset_addr
          pla
          rts
 
-LA3CF:   jsr     LA009
+; Draw the entire chess board with all pieces in current positions
+; Iterates board array $146E indexes $15-$62, draws each piece
+draw_full_board:   jsr     clear_screen
          ldx     #$15
-@LA3D4:  lda     $146e,x
+@piece_loop:  lda     $146e,x
          cmp     #$ff
-         beq     @LA3F4
+         beq     @next_sq
          sta     $aa
          txa
          pha
-         jsr     LA311
-         jsr     LA2DB
+         jsr     index_to_coords
+         jsr     rotate_piece_enc
          lda     $033c
          sta     $ab
          lda     $033d
          sta     $ac
-         jsr     LA296
+         jsr     draw_piece
          pla
          tax
-@LA3F4:  inx
+@next_sq:  inx
          cpx     #$63
-         bne     @LA3D4
-LA3F9:   jsr     LA4B5
+         bne     @piece_loop
+draw_board_frame:   jsr     clear_msg_line
          lda     #$00
          sta     $a3
          lda     #$1e
          sta     $a4
-         jsr     LA36B
+         jsr     calc_color_addr
          lda     #$78
          sta     $a5
          ldy     #$10
-@LA40D:  lda     #$80
+@rank_loop:  lda     #$80
          sta     ($a3),y
          lda     $20
          sta     ($f7),y
-         jsr     LA3C7
+         jsr     advance_row
          lda     $a5
          sta     ($a3),y
          lda     $20
          sta     ($f7),y
-         jsr     LA3C7
+         jsr     advance_row
          dec     $a5
          lda     $a5
          cmp     #$70
-         bne     @LA40D
+         bne     @rank_loop
          ldy     #$00
          lda     #$41
          sta     $a5
-@LA431:  lda     #$80
+@file_loop:  lda     #$80
          sta     ($a3),y
          lda     $20
          sta     ($f7),y
@@ -648,7 +768,7 @@ LA3F9:   jsr     LA4B5
          lda     $a5
          iny
          cmp     #$49
-         bne     @LA431
+         bne     @file_loop
          clc
          ldx     #$15
          ldy     #$0c
@@ -678,47 +798,53 @@ LA3F9:   jsr     LA4B5
          .byte   $92
          .byte   $00
 
+; Display a centered message on the message line below the board
+; Input: X/Y = pointer to null-terminated string
 show_msg:
          stx     $a5
          sty     $a6
-         jsr     LA4B5
+         jsr     clear_msg_line
          ldy     #$ff
-@LA492:  iny
+@len_loop:  iny
          lda     ($a5),y
-         bne     @LA492
+         bne     @len_loop
          tya
          lsr     A
          sta     $a7
          lda     #$08
          sec
          sbc     $a7
-         jsr     LA377
+         jsr     add_offset_addr
          ldy     #$00
-@LA4A5:  lda     ($a5),y
-         beq     @LA4B4
+@print_loop:  lda     ($a5),y
+         beq     @done
          ora     #$40
          sta     ($a3),y
          lda     #$01
          sta     ($f7),y
          iny
-         bne     @LA4A5
-@LA4B4:  rts
+         bne     @print_loop
+@done:  rts
 
-LA4B5:   lda     #$60
+clear_msg_line:   lda     #$60
          sta     $a3
          lda     #$1f
          sta     $a4
-         jsr     LA36B
+         jsr     calc_color_addr
          ldy     #$15
-@LA4C2:  lda     #$80
+@clr_loop:  lda     #$80
          sta     ($a3),y
          lda     $20
          sta     ($f7),y
          dey
-         bpl     @LA4C2
+         bpl     @clr_loop
          rts
 
-LA4CE:   lda     #$00
+; Load custom character set into VIC character RAM ($1A00-$1BFF)
+; First copies ROM charset ($8400) to $1A00, then overlays custom piece
+; glyphs from la55c/la634 into the custom character positions.
+; Also creates inverted versions (EOR #$FF) for dark squares.
+load_charset:   lda     #$00
          tay
          sta     $57
          sta     $59
@@ -726,18 +852,18 @@ LA4CE:   lda     #$00
          sta     $5a
          lda     #$84
          sta     $58
-@LA4DD:  lda     ($57),y
+@copy_loop:  lda     ($57),y
          sta     ($59),y
          inc     $57
          inc     $59
-         bne     @LA4EB
+         bne     @check_done
          inc     $58
          inc     $5a
-@LA4EB:  lda     $5a
+@check_done:  lda     $5a
          cmp     #$1c
-         bne     @LA4DD
+         bne     @copy_loop
          lda     $59
-         bne     @LA4DD
+         bne     @copy_loop
          sta     $5b
          lda     #$18
          sta     $5c
@@ -747,7 +873,7 @@ LA4CE:   lda     #$00
          sta     $57
          lda     #>la55c
          sta     $58
-         jsr     @LA518
+         jsr     @copy_block
          lda     #$d8
          sta     $59
          sta     $5b
@@ -755,17 +881,24 @@ LA4CE:   lda     #$00
          sta     $57
          lda     #>la634
          sta     $58
-@LA518:  ldy     #$00
-@LA51A:  lda     ($57),y
+@copy_block:  ldy     #$00
+@byte_loop:  lda     ($57),y
          sta     ($59),y
          eor     #$ff
          sta     ($5b),y
          iny
          cpy     #$d8
-         bne     @LA51A
+         bne     @byte_loop
          rts
 
-LA528:   .byte   $00,$00,$00,$00,$1d,$1e,$1b,$1c,$03,$04,$01,$02,$22,$23,$1f,$21
+; =====================================================================
+; DATA TABLES
+; =====================================================================
+
+; Piece glyph table: 4 bytes per glyph (2x2 character tile)
+; Indexed by piece type x4: empty, pawn, knight, bishop, rook, queen, king
+; Each entry has light-square and dark-square variants
+piece_glyphs:   .byte   $00,$00,$00,$00,$1d,$1e,$1b,$1c,$03,$04,$01,$02,$22,$23,$1f,$21
          .byte   $07,$08,$05,$06,$26,$27,$24,$25,$0b,$0c,$09,$0a,$2a,$2b,$28,$29
          .byte   $0f,$10,$0d,$0e,$2e,$2f,$2c,$2d,$13,$14,$11,$12,$2e,$2f,$30,$31
          .byte   $13,$14,$15,$16
@@ -783,6 +916,15 @@ la55c:   .byte   $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff,$00,$00,$01,$03,$03,$03,$01,$0f
          .byte   $80,$80,$e0,$e0,$80,$c0,$e0,$e0,$3c,$72,$70,$3c,$0e,$4e,$3c,$00
          .byte   $7e,$4e,$4e,$7e,$4e,$4e,$4e,$00,$7c,$72,$72,$7c,$4e,$4e,$4e,$00
          .byte   $7e,$4e,$40,$5e,$4e,$4e,$7e,$00
+; Custom character bitmaps (inverted versions for dark squares)
+; Also contains important lookup tables at fixed offsets:
+;   la634+216 ($070c): Initial piece setup for board ranks 1 & 8
+;   la634+223 ($0713): Piece values: 0,1,3,5,5,10,20 (empty,P,N,B,R,Q,K) x $80 base
+;   la634+229 ($0719): Move direction start index per piece type
+;   la634+235 ($071f): Number of move directions per piece type
+;   la634+242 ($0726): Direction offset table (8 queen dirs + 8 knight dirs)
+;   la634+260 ($0738): Piece-square table (positional values per square)
+;   la634+266 ($073e): Node count thresholds per depth level
 la634:   .byte   $ff,$fe,$fd,$fb,$fb,$fb,$e1,$ef,$ff,$7f,$bf,$df,$df,$df,$87,$f7
          .byte   $e1,$fd,$fd,$fd,$f9,$f3,$c7,$df,$87,$bf,$bf,$bf,$9f,$cf,$e3,$fb
          .byte   $ff,$ff,$8c,$b3,$b3,$bf,$bf,$bf,$ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff
@@ -888,16 +1030,22 @@ lpnbrqk: .byte   $00
          .asciiz "PNBRQK"
 lstalemate:
          .asciiz "STALEMATE"
+; VIC chip initialization register values (16 bytes for $9000-$900F)
 vic_init_regs:
          .byte   $05,$19,$96,$2e,$00,$fe,$00,$00,$ff,$ff,$00,$00,$00,$00,$0f,$6d
 
+; =====================================================================
+; NMI HANDLER AND STARTUP
+; =====================================================================
+
+; NMI handler - Restore/Stop key triggers game restart
 nmi_handler:  
 
 ;--- ORIGINAL (14 bytes) ---
 .if 0
          bit     $9111          ; 3
          jsr     $ffe1          ; 3
-         beq     LA911          ; 2
+         beq     game_restart          ; 2
          pla                    ; 1
          tay                    ; 1
          pla                    ; 1
@@ -909,7 +1057,7 @@ nmi_handler:
 
 ;--- PATCH (8 bytes) ---
          bit     $9111          ; 3
-         jmp     LA911          ; 3
+         jmp     game_restart          ; 3
          .res    2, $ea 
 ;--- END OF PATCH ---
 
@@ -944,17 +1092,19 @@ start:
          jsr     b_init_ram     ; 3
 ;--- END OF PATCH ---
 
-         jsr     LA4CE
-         jsr     LAAAB
-LA911:   sei
-         ldx     #$ff
+         jsr     load_charset
+         jsr     init_board
+; === GAME RESTART / MAIN LOOP ===
+; Resets stack, reinitializes VIC, runs title screen, then game loop
+game_restart:   sei
+         ldx     #$ff             ; reset stack pointer
          txs
          cli
          ldy     #$11
-@LA918:  lda     vic_init_regs-1,y
+@init_vic:  lda     vic_init_regs-1,y
          sta     $8fff,y
          dey
-         bne     @LA918
+         bne     @init_vic
          sty     $f9
          sty     $21
          sty     $22
@@ -963,53 +1113,53 @@ LA911:   sei
          lda     #$05
          sta     $20
          jsr     @welcome
-         jsr     LA3CF
-         jsr     LA07E
-         jsr     LACCC
-@LA93B:  lda     next_color
+         jsr     draw_full_board
+         jsr     flash_board
+         jsr     display_move_num
+@game_loop:  lda     next_color
          cmp     human_color
-         bne     @LA94C
+         bne     @human_turn
          sei
          jsr     sargon_moves
          cli
          jsr     @next_move
-         jmp     @LA93B
+         jmp     @game_loop
 
-@LA94C:  lda     #$03
+@human_turn:  lda     #$03
          sta     $97a7
          jsr     human_moves
          jsr     @next_move
-         jmp     @LA93B
+         jmp     @game_loop
 
 @next_move:
          lda     next_color
          eor     #$80
          sta     next_color
-         bne     @LA967
+         bne     @done
          inc     move_number
-         jmp     LACCC
+         jmp     display_move_num
 
-@LA967:  rts
+@done:  rts
 
 @welcome:
-         jsr     LA00E
+         jsr     clear_and_home
          ldx     #<lwelcome_msg
          ldy     #>lwelcome_msg
          jsr     input_string
-@LA972:  jsr     k_getchar
+@title_loop:  jsr     k_getchar
          cmp     #$85
-         beq     @LA9E4
+         beq     @start_game
          ldx     $028d
          cpx     #$07
-         beq     @LA986
+         beq     @show_adapted
          jsr     @screen_x_offset
-         jmp     @LA972
+         jmp     @title_loop
 
-@LA986:  jsr     LA011
+@show_adapted:  jsr     home_cursor
          ldx     #<ladapted
          ldy     #>ladapted
          jsr     $ad27
-         jmp     @LA972
+         jmp     @title_loop
 
 @screen_x_offset:
          tax
@@ -1050,7 +1200,7 @@ LA911:   sei
 
 @screen_fg_color:
          cpx     #$87
-         bne     @LA9E3
+         bne     @done2
          inc     $20
          lda     $20
          and     #$07
@@ -1059,28 +1209,28 @@ LA911:   sei
          and     #$f8
          ora     $20
          sta     $900f
-@LA9E3:  rts
+@done2:  rts
 
-@LA9E4:  jsr     LA019
+@start_game:  jsr     clear_screen_fill
          ldx     #<lgame_or_setup
          ldy     #>lgame_or_setup
          jsr     input
          cmp     #$53
-         beq     @LA9F5
-         jmp     @LAA65
+         beq     @setup_mode
+         jmp     @new_game
 
-@LA9F5:  jsr     LABCE
-         jsr     LA019
-@LA9FB:  ldx     #<lnextcolor
+@setup_mode:  jsr     setup_board_editor
+         jsr     clear_screen_fill
+@ask_color:  ldx     #<lnextcolor
          ldy     #>lnextcolor
          jsr     input
          ldx     #$00
          cmp     #'W'
-         beq     @LAA0E
+         beq     @set_color
          cmp     #'B'
-         bne     @LA9FB
+         bne     @ask_color
          ldx     #$80
-@LAA0E:  stx     next_color
+@set_color:  stx     next_color
          lda     #$01
          sta     $1c
          ldx     #<lmovenum
@@ -1088,16 +1238,16 @@ LA911:   sei
          jsr     input_string
          lda     #$00
          sta     move_number
-@LAA1F:  jsr     @LAA55
+@get_digit:  jsr     @read_digit
          cmp     #$0d
-         beq     @LAA1F
+         beq     @get_digit
          pha
          ora     #$80
          jsr     k_out_to_channel
-         jsr     @LAA55
+         jsr     @read_digit
          cmp     #$0d
-         beq     @LAA49
-         jsr     LA118
+         beq     @ones_digit
+         jsr     echo_char_cr
          tax
          pla
          tay
@@ -1113,65 +1263,68 @@ LA911:   sei
          clc
          adc     move_number
          sta     move_number
-@LAA49:  pla
+@ones_digit:  pla
          sec
          sbc     #$30
          clc
          adc     move_number
          sta     move_number
-         jmp     @LAA72
+         jmp     @choose_color
 
-@LAA55:  jsr     LA10C
+@read_digit:  jsr     wait_keypress
          cmp     #$0d
-         beq     @LAA64
+         beq     @digit_done
          cmp     #$30
-         bcc     @LAA55
+         bcc     @read_digit
          cmp     #$3a
-         bcs     @LAA55
-@LAA64:  rts
+         bcs     @read_digit
+@digit_done:  rts
 
-@LAA65:  lda     #$00
+@new_game:  lda     #$00
          sta     next_color
          sta     $1c
          lda     #$01
          sta     move_number
-         jsr     LAAAB
-@LAA72:  ldx     #<lchoose_color
+         jsr     init_board
+@choose_color:  ldx     #<lchoose_color
          ldy     #>lchoose_color
          jsr     input
          ldx     #$80
          cmp     #'W'
-         beq     @LAA85
+         beq     @set_human
          cmp     #'B'
-         bne     @LAA72
+         bne     @choose_color
          ldx     #$00
-@LAA85:  stx     human_color
-@LAA87:  ldx     #<lchoose_level
+@set_human:  stx     human_color
+@choose_level:  ldx     #<lchoose_level
          ldy     #>lchoose_level
          jsr     input
          cmp     #'0'
-         bcc     @LAA87
+         bcc     @choose_level
          cmp     #'7'
-         bcs     @LAA87
+         bcs     @choose_level
          and     #$0f
          sta     level
          lda     #$00
          ldx     #$1b
-@LAA9E:  sta     $12fe,x
+@clear_hist:  sta     $12fe,x
          dex
-         bpl     @LAA9E
+         bpl     @clear_hist
          lda     #$01
          sta     next_color+1
-         jmp     LBCE4
+         jmp     init_board_state
 
-LAAAB:   ldx     #$77
+; Initialize the 10x12 board array at $146E with starting position
+; Fills borders with $FF, places pieces from la634+216 setup data
+; White pieces at ranks 1-2, black pieces (OR $80) at ranks 7-8
+init_board:   ldx     #$77
          lda     #$ff
-@LAAAF:  sta     $146e,x
+@fill_ff:  sta     $146e,x
          dex
-         bpl     @LAAAF
+         bpl     @fill_ff
          ldx     #$08
          ldy     #$00
-@LAAB9:  lda     la634+216,y
+@setup_loop:  lda     la634+216,y
          sta     $1483,y
          ora     #$80
          sta     $14c9,y
@@ -1186,31 +1339,36 @@ LAAAB:   ldx     #$77
          sta     $14b5,y
          iny
          dex
-         bne     @LAAB9
+         bne     @setup_loop
          rts
 
+; =====================================================================
+; AI AND HUMAN MOVE HANDLING
+; =====================================================================
+
+; Computer plays a move: runs search, checks for mate/stalemate, displays
 sargon_moves:
-         jsr     LA3F9
+         jsr     draw_board_frame
          lda     #$02
          sta     $97a7
          jsr     calc_move
          lda     scoreH_stack
-         bne     @LAAF6
+         bne     @not_mate
          lda     scoreL_stack
          cmp     #$01
          beq     @mate0
-@LAAF6:  jsr     LAD76
+@not_mate:  jsr     check_stalemate
          bcs     @stalemate
-         jsr     LAD54
+         jsr     push_move_history
          ldx     #$b4
-         jsr     LA161
-         jsr     LAC32
+         jsr     beep
+         jsr     execute_display_move
          lda     scoreH_stack
          cmp     #$ff
-         bne     @LAB23
+         bne     @done
          lda     scoreL_stack
          cmp     #$fe
-         beq     @LAB34
+         beq     @show_mate
          ldx     #<lmatein2
          ldy     #>lmatein2
          jsr     show_msg
@@ -1219,47 +1377,51 @@ sargon_moves:
          lsr     A
          adc     #$6f
          sta     $1f6c
-@LAB23:  rts
+@done:  rts
 
 @stalemate:
          ldx     #<lstalemate
          ldy     #>lstalemate
          jsr     show_msg
-         jmp     @LAB3B
+         jmp     @wait_restart
 
 @mate0:  lda     next_color
          eor     #$80
          sta     next_color
-@LAB34:  ldx     #<lmate
+@show_mate:  ldx     #<lmate
          ldy     #>lmate
          jsr     show_msg
-@LAB3B:  ldx     #$c8
-         jsr     LA161
+@wait_restart:  ldx     #$c8
+         jsr     beep
          cli
-         jsr     LA10C
-         jmp     LA911
+         jsr     wait_keypress
+         jmp     game_restart
 
-LAB47:   tay
+; Convert byte in A to 2-digit decimal ASCII at $033C,X and $033C,X-1
+byte_to_decimal:   tay
          lda     #$2f
          sta     $033c,x
          tya
-@LAB4E:  cmp     #$0a
-         bcc     @LAB5A
+@div10:  cmp     #$0a
+         bcc     @store_ones
          inc     $033c,x
          sec
          sbc     #$0a
-         bne     @LAB4E
-@LAB5A:  dex
+         bne     @div10
+@store_ones:  dex
          ora     #$40
          sta     $033c,x
          rts
 
-LAB61:   lda     $033c,x
+; Parse algebraic notation from input buffer at $033C,X
+; E.g. "E2" -> board index. Returns carry set if invalid.
+; Reads rank (1-8) and file (A-H), converts to 10x12 mailbox index
+parse_algebraic:   lda     $033c,x
          and     #$7f
          cmp     #$31
-         bcc     @LAB98
+         bcc     @invalid
          cmp     #$39
-         bcs     @LAB98
+         bcs     @invalid
          and     #$0f
          clc
          adc     #$01
@@ -1273,9 +1435,9 @@ LAB61:   lda     $033c,x
          lda     $033c,x
          and     #$7f
          cmp     #$41
-         bcc     @LAB98
+         bcc     @invalid
          cmp     #$49
-         bcs     @LAB98
+         bcs     @invalid
          and     #$0f
          clc
          adc     $0341
@@ -1284,66 +1446,69 @@ LAB61:   lda     $033c,x
          dex
          rts
 
-@LAB98:  sec
+@invalid:  sec
          rts
 
+; Human move input: generate legal moves, get input, validate, execute
 human_moves:
          lda     #$01
          sta     $8e
          lda     #$10
          sta     $8f
-         jsr     LAEC0
-@LABA5:  jsr     LA0A6
+         jsr     init_move_gen
+@input_loop:  jsr     get_input
          ldx     #$04
-@LABAA:  jsr     LAB61
-         bcs     @LABBF
-         bpl     @LABAA
-         jsr     LADDA
-         bcs     @LABBF
-         jsr     LAD54
-         jsr     LA3F9
-         jmp     LAC32
+@parse_loop:  jsr     parse_algebraic
+         bcs     @bad_move
+         bpl     @parse_loop
+         jsr     find_move
+         bcs     @bad_move
+         jsr     push_move_history
+         jsr     draw_board_frame
+         jmp     execute_display_move
 
-@LABBF:  ldx     #<linvalid_move
+@bad_move:  ldx     #<linvalid_move
          ldy     #>linvalid_move
          jsr     show_msg
          ldx     #$aa
-         jsr     LA161
-         jmp     @LABA5
+         jsr     beep
+         jmp     @input_loop
 
-LABCE:   jsr     LA10C
-         jsr     LA3CF
+; Board setup editor: navigate with cursor keys, type piece letters to place
+; RETURN = done, cursor keys = move, piece letter = place piece
+setup_board_editor:   jsr     wait_keypress
+         jsr     draw_full_board
          ldx     #$15
-@LABD6:  stx     $07
-@LABD8:  jsr     LA210
+@set_sq:  stx     $07
+@edit_loop:  jsr     joy_highlight_sq
          jsr     k_getchar
-         beq     @LABD8
+         beq     @edit_loop
          cmp     #$0d
-         bne     @LABEB
-         jsr     LBCE4
-         jsr     LA009
+         bne     @move_cursor
+         jsr     init_board_state
+         jsr     clear_screen
          rts
 
-@LABEB:  jsr     LA225
+@move_cursor:  jsr     joy_move_cursor
          cpy     #$ff
-         bne     @LABD6
+         bne     @set_sq
          ldx     #$06
-@LABF4:  cmp     lpnbrqk,x
-         beq     @LABFF
+@find_piece:  cmp     lpnbrqk,x
+         beq     @set_piece
          dex
-         bne     @LABF4
+         bne     @find_piece
          txa
-         beq     @LAC20
-@LABFF:  stx     $aa
-         jsr     LA10C
+         beq     @place_piece
+@set_piece:  stx     $aa
+         jsr     wait_keypress
          ldy     #$00
          cmp     #$57
-         beq     @LAC0C
+         beq     @set_color
          ldy     #$80
-@LAC0C:  tya
+@set_color:  tya
          ora     $aa
          sta     $aa
-         jsr     LA10C
+         jsr     wait_keypress
          ldy     $aa
          and     #$01
          lsr     A
@@ -1352,169 +1517,174 @@ LABCE:   jsr     LA10C
          sta     $aa
          tya
          ora     $aa
-@LAC20:  ldx     $07
+@place_piece:  ldx     $07
          sta     $146e,x
          sta     $aa
-         jsr     LA2DB
-         jsr     LA296
+         jsr     rotate_piece_enc
+         jsr     draw_piece
          ldx     $07
-         jmp     @LABD8
+         jmp     @edit_loop
 
-LAC32:   jsr     LACB6
+; Execute and display a move: animate piece, handle castling/en passant display
+; Reads move flags from $1332 to determine special move types
+execute_display_move:   jsr     display_move_check
          lda     $0b
          sta     $07
          lda     $0c
          sta     $08
-         jsr     LA32B
+         jsr     animate_piece
          bit     $1332
-         bmi     @LAC56
-         bvc     LACB5
+         bmi     @castling
+         bvc     move_done_rts
          lda     #$0a
          bit     next_color
-         bmi     @LAC4F
+         bmi     @ep_black
          lda     #$f6
-@LAC4F:  clc
+@ep_black:  clc
          adc     $08
          sta     $08
-         bne     @LAC6B
-@LAC56:  lda     $08
+         bne     @do_rook
+@castling:  lda     $08
          sec
          sbc     $07
          cmp     #$02
-         beq     @LAC64
+         beq     @queenside
          inc     $08
          asl     A
-         bne     @LAC68
-@LAC64:  dec     $08
+         bne     @rook_from
+@queenside:  dec     $08
          inc     $07
-@LAC68:  clc
+@rook_from:  clc
          adc     $07
-@LAC6B:  sta     $07
-         jmp     LA32B
+@do_rook:  sta     $07
+         jmp     animate_piece
 
-LAC70:   bit     $1332
-         bmi     @LAC9D
-         bvs     @LAC97
+format_move_str:   bit     $1332
+         bmi     @castling
+         bvs     @en_passant
          ldx     #$01
          lda     $0b
-         jsr     LAB47
+         jsr     byte_to_decimal
          ldx     #$04
          lda     $0c
-         jsr     LAB47
+         jsr     byte_to_decimal
          ldx     #$2d
          lda     $1328
-         beq     @LAC8E
+         beq     @set_sep
          ldx     #$58
-@LAC8E:  stx     $033e
+@set_sep:  stx     $033e
          ldx     #$3c
          ldy     #$03
-         bne     @LACB0
+         bne     @print_str
 
-@LAC97:  ldx     #<lpxpep
+@en_passant:  ldx     #<lpxpep
          ldy     #>lpxpep
-         bne     @LACB0
+         bne     @print_str
 
-@LAC9D:  lda     $0c
+@castling:  lda     $0c
          sec
          sbc     $0b
          cmp     #$02
-         beq     @LACAC
+         beq     @kingside
          ldx     #<looo
          ldy     #>looo
-         bne     @LACB0
+         bne     @print_str
 
-@LACAC:  ldx     #<loo
+@kingside:  ldx     #<loo
          ldy     #>loo
-@LACB0:  lda     #$00
+@print_str:  lda     #$00
          sta     $0341
-LACB5:   rts
+move_done_rts:   rts
 
-LACB6:   jsr     LAC70
-         jsr     LA09B
-LACBC:   lda     next_color
+display_move_check:   jsr     format_move_str
+         jsr     print_and_redraw
+check_for_check:   lda     next_color
          eor     #$80
-         jsr     LBBD3
-         bcc     LACB5
+         jsr     is_king_checked
+         bcc     move_done_rts
          ldx     #<lcheck
          ldy     #>lcheck
          jmp     show_msg
 
-LACCC:   ldx     #$30
+display_move_num:   ldx     #$30
          lda     move_number
-@LACD0:  cmp     #$0a
-         bcc     @LACDA
+@div10:  cmp     #$0a
+         bcc     @format
          inx
          sec
          sbc     #$0a
-         bne     @LACD0
-@LACDA:  clc
+         bne     @div10
+@format:  clc
          adc     #$30
          sta     $033d
          txa
          cmp     #$40
-         bcs     @LACE9
+         bcs     @blank
          cmp     #$30
-         bne     @LACEB
-@LACE9:  lda     #$20
-@LACEB:  sta     $033c
+         bne     @store_tens
+@blank:  lda     #$20
+@store_tens:  sta     $033c
          lda     #$00
          sta     $033e
          ldx     #$3c
          ldy     #$03
-         jmp     LA09B
+         jmp     print_and_redraw
 
-LACFA:   jsr     LA06E
+display_move_full:   jsr     clear_input_line
          lda     #$00
          sta     $f9
          sta     $00
-         jsr     LAC70
-         jsr     LAD12
+         jsr     format_move_str
+         jsr     print_string_xy
          lda     #$00
          sta     $f9
          sta     $00
-         jmp     LACBC
+         jmp     check_for_check
 
-LAD12:   stx     $05
+print_string_xy:   stx     $05
          sty     $06
          ldy     #$00
-@LAD18:  lda     ($05),y
-         beq     @LAD26
+@print_loop:  lda     ($05),y
+         beq     @done
          sty     $a3
-         jsr     LA08A
+         jsr     put_char
          ldy     $a3
          iny
-         bne     @LAD18
-@LAD26:  rts
+         bne     @print_loop
+@done:  rts
 
 input_string:
          stx     $05
          sty     $06
          ldy     #$00
-@LAD2D:  lda     ($05),y
-         beq     @LAD37
+@print_loop:  lda     ($05),y
+         beq     @done
          jsr     k_out_to_channel
          iny
-         bne     @LAD2D
-@LAD37:  rts
+         bne     @print_loop
+@done:  rts
 
-LAD38:   ldy     level+1
+; Show hint: display the computer's best move (triggered by '?' key)
+hint_move:   ldy     level+1
          cpy     #$02
-         bcc     @LAD51
+         bcc     @done
          lda     $9f
          sta     $07
          lda     $b4
          sta     $0a
-         jsr     LADDA
-         bcs     @LAD51
-         jsr     LB8C7
-         jsr     LACFA
-@LAD51:  jmp     LA0F6
+         jsr     find_move
+         bcs     @done
+         jsr     unmake_move
+         jsr     display_move_full
+@done:  jmp     poll_keyboard
 
-LAD54:   ldx     #$17
-@LAD56:  lda     $12fe,x
+; Push current move onto the move history stack at $12FE
+; Shifts existing entries down, stores from/to/flags at top
+push_move_history:   ldx     #$17
+@shift_loop:  lda     $12fe,x
          sta     $1302,x
          dex
-         bpl     @LAD56
+         bpl     @shift_loop
          lda     $0b
          sta     $12fe
          lda     $0c
@@ -1525,33 +1695,36 @@ LAD54:   ldx     #$17
          sta     $1301
          rts
 
-LAD76:   lda     $6a
+; Check for draw by repetition or stalemate
+; Compares last move with move from 4 plies ago; also checks material
+; Returns carry set if stalemate detected
+check_stalemate:   lda     $6a
          bit     human_color
-         bmi     @LAD81
+         bmi     @check_val
          eor     #$ff
          clc
          adc     #$01
-@LAD81:  clc
+@check_val:  clc
          adc     #$80
          cmp     #$81
-         bcs     @LADD4
+         bcs     @no_draw
          lda     $12fe
          cmp     $130e
-         bne     @LADD4
+         bne     @no_draw
          lda     $12ff
          cmp     $130f
-         bne     @LADD4
+         bne     @no_draw
          lda     $1001
          cmp     $130a
-         bne     @LADD4
+         bne     @no_draw
          lda     $1002
          cmp     $130b
-         bne     @LADD4
+         bne     @no_draw
          lda     #$02
          sta     $8d
-         jsr     LADF2
-         bcs     @LADD4
-         jsr     LB3AF
+         jsr     try_make_move
+         bcs     @no_draw
+         jsr     evaluate_position
          lda     $1328
          and     #$07
          tax
@@ -1559,7 +1732,7 @@ LAD76:   lda     $6a
          asl     A
          sec
          sbc     $63
-         bmi     @LADD1
+         bmi     @undo
          lda     $1003
          sta     $1001
          lda     $1004
@@ -1567,94 +1740,107 @@ LAD76:   lda     $6a
          clc
          rts
 
-@LADD1:  jsr     LB8C7
-@LADD4:  lda     #$00
+@undo:  jsr     unmake_move
+@no_draw:  lda     #$00
          sta     $8d
-         beq     LADF2
+         beq     try_make_move
 
-LADDA:   ldx     #$fe
-@LADDC:  inx
+; Find a move in the generated move list matching from=$07, to=$0A
+; Returns carry set if not found; sets $9C/$8D to move index if found
+find_move:   ldx     #$fe
+@scan_loop:  inx
          inx
          lda     $1001,x
-         beq     LADFD
+         beq     move_not_found
          cmp     $07
-         bne     @LADDC
+         bne     @scan_loop
          lda     $1002,x
          cmp     $0a
-         bne     @LADDC
+         bne     @scan_loop
          stx     $9c
          stx     $8d
-LADF2:   jsr     LB7C4
-         jsr     LBBD1
-         bcc     LADFE
-         jsr     LB8C7
-LADFD:   sec
-LADFE:   rts
+; Try to make a move: execute it, check if own king is in check
+; If illegal (leaves king in check), unmake and return carry set
+try_make_move:   jsr     make_move
+         jsr     is_own_king_checked
+         bcc     return_from_move  ; legal: carry clear
+         jsr     unmake_move       ; illegal: undo
+move_not_found:   sec
+return_from_move:   rts
 
-LADFF:   ldx     $0d
+; =====================================================================
+; MOVE GENERATION
+; =====================================================================
+
+; Generate pseudo-legal moves for a single piece
+; $07 = piece square, $0D = piece type, $13 = full piece byte
+; Walks each direction ray, storing from/to pairs via store_move_pair
+; Handles pawn special moves (double push, captures, en passant)
+gen_piece_moves:   ldx     $0d
          lda     la634+235,x
          sta     $10
          lda     la634+229,x
          cmp     #$10
-         bne     @LAE14
+         bne     @set_dir
          bit     $13
-         bpl     @LAE14
+         bpl     @set_dir
          clc
          adc     #$04
-@LAE14:  sta     $0f
-@LAE16:  ldx     $0f
+@set_dir:  sta     $0f
+@dir_loop:  ldx     $0f
          lda     la634+242,x
          sta     $11
          ldx     $07
-@LAE1F:  clc
+@ray_loop:  clc
          txa
          adc     $11
          tax
          lda     $146e,x
-         beq     @LAE33
+         beq     @empty_sq
          cmp     #$ff
-         beq     @LAE4C
+         beq     @next_dir
          eor     $13
-         bpl     @LAE4C
+         bpl     @next_dir
          eor     $13
-@LAE33:  sta     $0e
+@empty_sq:  sta     $0e
          lda     $0d
          cmp     #$01
-         beq     @LAE53
-         jsr     LAE79
+         beq     @pawn_move
+         jsr     store_move_pair
          lda     $0e
-         bne     @LAE4C
+         bne     @next_dir
          lda     $0d
          cmp     #$06
-         beq     @LAE4C
+         beq     @next_dir
          cmp     #$03
-         bcs     @LAE1F
-@LAE4C:  inc     $0f
+         bcs     @ray_loop
+@next_dir:  inc     $0f
          dec     $10
-         bne     @LAE16
+         bne     @dir_loop
          rts
 
-@LAE53:  lda     $10
+@pawn_move:  lda     $10
          cmp     #$03
-         bcs     @LAE69
+         bcs     @pawn_capture
          lda     $0e
-         bne     @LAE68
-         jsr     LAE79
+         bne     @pawn_done
+         jsr     store_move_pair
          bit     $13
-         bvs     @LAE68
+         bvs     @pawn_done
          dec     $10
-         bne     @LAE1F
-@LAE68:  rts
+         bne     @ray_loop
+@pawn_done:  rts
 
-@LAE69:  lda     $0e
-         beq     @LAE73
-         jsr     LAE79
-         jmp     @LAE4C
+@pawn_capture:  lda     $0e
+         beq     @try_ep
+         jsr     store_move_pair
+         jmp     @next_dir
 
-@LAE73:  jsr     LAE83
-         jmp     @LAE4C
+@try_ep:  jsr     check_en_passant
+         jmp     @next_dir
 
-LAE79:   lda     $07
+; Store a from/to move pair into the move list at ($8B),Y
+store_move_pair:   lda     $07
          sta     ($8b),y
          iny
          txa
@@ -1662,41 +1848,47 @@ LAE79:   lda     $07
          iny
          rts
 
-LAE83:   lda     $07
+; Check if en passant capture is possible for current pawn
+; Verifies pawn is on correct rank, adjacent enemy pawn just double-pushed
+check_en_passant:   lda     $07
          bit     $13
-         bpl     @LAE8C
+         bpl     @check_rank
          clc
          adc     #$0a
-@LAE8C:  cmp     #$3d
-         bcc     @LAEBF
+@check_rank:  cmp     #$3d
+         bcc     @no_ep
          cmp     #$45
-         bcs     @LAEBF
+         bcs     @no_ep
          lda     $0b
          sec
          sbc     $0c
          cmp     #$14
-         beq     @LAEA1
+         beq     @save_to
          cmp     #$ec
-         bne     @LAEBF
-@LAEA1:  stx     $08
+         bne     @no_ep
+@save_to:  stx     $08
          ldx     $0c
          lda     $146e,x
          and     #$07
          cmp     #$01
-         bne     @LAEBF
+         bne     @no_ep
          txa
          ldx     $08
          sec
          sbc     $08
          cmp     #$0a
-         beq     @LAEBC
+         beq     @store_ep
          cmp     #$f6
-         bne     @LAEBF
-@LAEBC:  jmp     LAE79
+         bne     @no_ep
+@store_ep:  jmp     store_move_pair
 
-@LAEBF:  rts
+@no_ep:  rts
 
-LAEC0:   ldy     next_color+1
+; Initialize move generation for the side to move
+; Sets up move list pointers, generates castling moves, then iterates
+; all pieces of the current color to generate their pseudo-legal moves
+; Move list stored at ($8B),Y as pairs of (from, to) bytes, null-terminated
+init_move_gen:   ldy     next_color+1
          lda     $8e
          sta     $1459,y
          sta     $8b
@@ -1707,24 +1899,24 @@ LAEC0:   ldy     next_color+1
          sta     $133b,y
          sta     $8d
          tay
-         jsr     @LAF13
+         jsr     @try_castle
          ldx     #$15
          stx     $07
-@LAEDF:  lda     $146e,x
-         beq     @LAEF7
+@piece_loop:  lda     $146e,x
+         beq     @next_piece
          cmp     #$ff
-         beq     @LAEF7
+         beq     @next_piece
          eor     next_color
-         bmi     @LAEF7
+         bmi     @next_piece
          eor     next_color
          sta     $13
          and     #$07
          sta     $0d
-         jsr     LADFF
-@LAEF7:  inc     $07
+         jsr     gen_piece_moves
+@next_piece:  inc     $07
          ldx     $07
          cpx     #$63
-         bcc     @LAEDF
+         bcc     @piece_loop
          lda     #$00
          sta     $1d
          sta     ($8b),y
@@ -1738,335 +1930,349 @@ LAEC0:   ldy     next_color+1
          sta     $8f
          rts
 
-@LAF13:  ldx     $6c
+@try_castle:  ldx     $6c
          lda     next_color
-         bpl     @LAF1B
+         bpl     @check_moved
          ldx     $6d
-@LAF1B:  lda     $146e,x
+@check_moved:  lda     $146e,x
          and     #$40
-         bne     @LAF79
+         bne     @castle_done
          lda     $146e,x
          sta     $13
          stx     $07
-         jsr     LAF7A
-         bcs     @LAF79
+         jsr     is_king_attacked
+         bcs     @castle_done
          lda     #$02
          sta     $12
          lda     #$ff
          sta     $09
          lda     #$03
-@LAF38:  clc
+@castle_dir:  clc
          adc     $07
          tax
          lda     $146e,x
          and     #$7f
          cmp     #$04
-         bne     @LAF66
-@LAF45:  txa
+         bne     @try_other
+@check_path:  txa
          clc
          adc     $09
          tax
          lda     $146e,x
-         bne     @LAF66
+         bne     @try_other
          lda     $12
          cmp     #$03
-         beq     @LAF5A
-         jsr     LAF7A
-         bcs     @LAF66
-@LAF5A:  dec     $12
-         bne     @LAF45
+         beq     @path_clear
+         jsr     is_king_attacked
+         bcs     @try_other
+@path_clear:  dec     $12
+         bne     @check_path
          txa
          sec
          sbc     $09
          tax
-         jsr     LAE79
-@LAF66:  lda     $09
-         bpl     @LAF79
+         jsr     store_move_pair
+@try_other:  lda     $09
+         bpl     @castle_done
          ldx     $07
          lda     #$03
          sta     $12
          lda     #$01
          sta     $09
          lda     #$fc
-         jmp     @LAF38
+         jmp     @castle_dir
 
-@LAF79:  rts
+@castle_done:  rts
 
-LAF7A:   stx     $08
+; Check if the king at square X is under attack
+; Scans all 16 directions (8 queen + 8 knight) from king's position
+; Returns carry set if attacked, carry clear if safe
+; $13 = king's piece byte (determines which side is defending)
+is_king_attacked:   stx     $08
          lda     #$10
          sta     $10
          lda     #$00
          sta     $0f
-@LAF84:  lda     #$fe
+@dir_loop:  lda     #$fe
          sta     $0e
          ldx     $0f
          lda     la634+242,x
          sta     $11
          ldx     $08
-@LAF91:  inc     $0e
+@ray_step:  inc     $0e
          clc
          txa
          adc     $11
          tax
          lda     $146e,x
-         beq     @LAFA3
+         beq     @empty_check
          cmp     #$ff
-         beq     @LAFA9
-         bne     @LAFB6
+         beq     @next_dir
+         bne     @found_piece
 
-@LAFA3:  lda     $10
+@empty_check:  lda     $10
          cmp     #$09
-         bcs     @LAF91
-@LAFA9:  inc     $0f
+         bcs     @ray_step
+@next_dir:  inc     $0f
          dec     $10
-         bne     @LAF84
+         bne     @dir_loop
          clc
-         bcc     @LAFB3
+         bcc     @restore_x
 
-@LAFB2:  sec
-@LAFB3:  ldx     $08
+@attacked:  sec
+@restore_x:  ldx     $08
          rts
 
-@LAFB6:  eor     $13
-         bpl     @LAFA9
+@found_piece:  eor     $13
+         bpl     @next_dir
          eor     $13
          and     #$07
          sta     $0d
          lda     $10
          cmp     #$09
-         bcc     @LB007
+         bcc     @check_knight
          lda     $0d
          cmp     #$05
-         beq     @LAFB2
+         beq     @attacked
          bit     $0e
-         bpl     @LAFD4
+         bpl     @check_type
          cmp     #$06
-         beq     @LAFB2
-@LAFD4:  lda     $10
+         beq     @attacked
+@check_type:  lda     $10
          cmp     #$0d
-         bcc     @LAFFE
+         bcc     @check_rook
          lda     $0d
          cmp     #$03
-         beq     @LAFB2
+         beq     @attacked
          bit     $0e
-         bpl     @LAFA9
+         bpl     @next_dir
          cmp     #$01
-         bne     @LAFA9
+         bne     @next_dir
          lda     $13
-         bmi     @LAFF5
+         bmi     @pawn_bk
          lda     $10
          cmp     #$0f
-         bcc     @LAFA9
-         jmp     @LAFB2
+         bcc     @next_dir
+         jmp     @attacked
 
-@LAFF5:  lda     $10
+@pawn_bk:  lda     $10
          cmp     #$0f
-         bcs     @LAFA9
-         jmp     @LAFB2
+         bcs     @next_dir
+         jmp     @attacked
 
-@LAFFE:  lda     $0d
+@check_rook:  lda     $0d
          cmp     #$04
-         bne     @LAFA9
-         jmp     @LAFB2
+         bne     @next_dir
+         jmp     @attacked
 
-@LB007:  lda     $0d
+@check_knight:  lda     $0d
          cmp     #$02
-         bne     @LAFA9
-         beq     @LAFB2
+         bne     @next_dir
+         beq     @attacked
 
-LB00F:   lda     #$00
+; =====================================================================
+; BOARD EVALUATION (Sargon "POINTS" routine)
+; =====================================================================
+
+; Build attack/defend tables for all pieces on the board
+; $1346-$13C5 = attack table (enemies attacking each square)
+; $13C6-$1445 = defend table (friendly pieces defending)
+; $6E = defend count (counts down from $7F), $6F = attack count (counts up)
+build_attack_table:   lda     #$00
          sta     $6f
          lda     #$7f
          sta     $6e
          ldx     #$15
          stx     $07
-@LB01B:  lda     $146e,x
-         beq     @LB02D
+@piece_loop:  lda     $146e,x
+         beq     @next_sq
          cmp     #$ff
-         beq     @LB02D
+         beq     @next_sq
          sta     $13
          and     #$07
          sta     $0d
-         jsr     @LB036
-@LB02D:  inc     $07
+         jsr     @scan_piece
+@next_sq:  inc     $07
          ldx     $07
          cpx     #$63
-         bcc     @LB01B
+         bcc     @piece_loop
          rts
 
-@LB036:  ldx     $0d
+@scan_piece:  ldx     $0d
          lda     la634+235,x
          sta     $10
          lda     la634+229,x
          cmp     #$10
-         bne     @LB04F
+         bne     @set_start
          dec     $10
          dec     $10
          bit     $13
-         bpl     @LB04F
+         bpl     @set_start
          clc
          adc     #$04
-@LB04F:  sta     $0f
-@LB051:  ldx     $0f
+@set_start:  sta     $0f
+@dir_loop:  ldx     $0f
          lda     la634+242,x
          sta     $11
          ldx     $07
          lda     #$00
          sta     $12
-@LB05E:  clc
+@ray_loop:  clc
          txa
          adc     $11
          tax
          lda     $146e,x
          cmp     #$ff
-         bne     @LB071
-@LB06A:  inc     $0f
+         bne     @found
+@next_dir:  inc     $0f
          dec     $10
-         bne     @LB051
+         bne     @dir_loop
          rts
 
-@LB071:  sta     $14
+@found:  sta     $14
          and     #$07
          sta     $0e
          bit     $12
-         bvs     @LB0B2
+         bvs     @xray
          lda     la634+260,x
          lsr     A
          bit     $13
-         bpl     @LB088
+         bpl     @adjust_mob
          eor     #$ff
          clc
          adc     #$01
-@LB088:  clc
+@adjust_mob:  clc
          adc     $68
          sta     $68
          lda     $14
-         beq     @LB0E2
+         beq     @check_slide
          eor     $13
-         bpl     @LB0CB
+         bpl     @enemy
          lda     $0e
          cmp     #$06
-         bne     @LB09F
+         bne     @own_piece
          lda     #$01
          sta     $69
-@LB09F:  lda     $12
+@own_piece:  lda     $12
          and     #$01
-         bne     @LB0A7
+         bne     @set_flags
          ora     #$40
-@LB0A7:  ora     #$20
+@set_flags:  ora     #$20
          sta     $12
          ldy     $6e
          dec     $6e
-         jmp     @LB0D5
+         jmp     @store_atk
 
-@LB0B2:  lda     $0e
-         beq     @LB05E
+@xray:  lda     $0e
+         beq     @ray_loop
          cmp     #$01
-         beq     @LB06A
+         beq     @next_dir
          lda     $14
          eor     $13
-         bpl     @LB06A
+         bpl     @next_dir
          txa
          ora     #$80
          tax
          lda     $12
          and     #$bf
-         jmp     @LB0A7
+         jmp     @set_flags
 
-@LB0CB:  lda     $12
+@enemy:  lda     $12
          ora     #$01
          sta     $12
          ldy     $6f
          inc     $6f
-@LB0D5:  txa
+@store_atk:  txa
          sta     $1346,y
          lda     $12
          and     #$80
          ora     $07
          sta     $13c6,y
-@LB0E2:  lda     $0d
+@check_slide:  lda     $0d
          cmp     #$03
-         bcs     @LB0EB
-@LB0E8:  jmp     @LB06A
+         bcs     @check_king
+@jmp_next_dir:  jmp     @next_dir
 
-@LB0EB:  cmp     #$06
-         beq     @LB0E8
+@check_king:  cmp     #$06
+         beq     @jmp_next_dir
          bit     $12
-         bvc     @LB0F6
-@LB0F3:  jmp     @LB05E
+         bvc     @check_blocked
+@jmp_ray:  jmp     @ray_loop
 
-@LB0F6:  lda     $12
+@check_blocked:  lda     $12
          and     #$20
-         bne     @LB0E8
+         bne     @jmp_next_dir
          lda     $0e
-         beq     @LB0F3
+         beq     @jmp_ray
          lda     $0d
          cmp     #$04
-         bne     @LB119
+         bne     @check_bishop
          lda     $0e
          cmp     #$04
-         beq     @LB0F3
+         beq     @jmp_ray
          cmp     #$05
-         bne     @LB0E8
-@LB110:  lda     $12
+         bne     @jmp_next_dir
+@set_xray:  lda     $12
          ora     #$80
          sta     $12
-         jmp     @LB05E
+         jmp     @ray_loop
 
-@LB119:  cmp     #$03
-         bne     @LB129
+@check_bishop:  cmp     #$03
+         bne     @check_q_r
          lda     $0e
          cmp     #$01
-         beq     @LB153
+         beq     @same_dir
          cmp     #$05
-         bne     @LB0E8
-         beq     @LB110
+         bne     @jmp_next_dir
+         beq     @set_xray
 
-@LB129:  lda     $0e
+@check_q_r:  lda     $0e
          cmp     #$03
-         bne     @LB138
+         bne     @check_rook
          lda     $10
          cmp     #$05
-         bcc     @LB0E8
-         jmp     @LB05E
+         bcc     @jmp_next_dir
+         jmp     @ray_loop
 
-@LB138:  cmp     #$04
-         bne     @LB145
+@check_rook:  cmp     #$04
+         bne     @check_queen
          lda     $10
          cmp     #$05
-         bcc     @LB0F3
-         jmp     @LB06A
+         bcc     @jmp_ray
+         jmp     @next_dir
 
-@LB145:  cmp     #$05
-         beq     @LB0F3
+@check_queen:  cmp     #$05
+         beq     @jmp_ray
          cmp     #$01
-         bne     @LB0E8
+         bne     @jmp_next_dir
          lda     $10
          cmp     #$05
-         bcc     @LB0E8
-@LB153:  lda     $13
+         bcc     @jmp_next_dir
+@same_dir:  lda     $13
          eor     $11
-         bmi     @LB0E8
+         bmi     @jmp_next_dir
          lda     $12
          ora     #$20
          sta     $12
-         jmp     @LB05E
+         jmp     @ray_loop
 
-LB162:   lda     $6e
+; Prune illegal entries from attack/defend tables
+; Removes attacks that are blocked by pinned pieces, etc.
+prune_illegal:   lda     $6e
          eor     #$ff
          clc
          adc     #$80
-         beq     @LB179
+         beq     @done
          sta     $10
          ldy     #$7f
-@LB16F:  lda     $1346,y
-         bmi     @LB17A
-@LB174:  dey
+@scan_def:  lda     $1346,y
+         bmi     @process
+@next_entry:  dey
          dec     $10
-         bne     @LB16F
-@LB179:  rts
+         bne     @scan_def
+@done:  rts
 
-@LB17A:  sty     $11
+@process:  sty     $11
          and     #$7f
          sta     $09
          lda     $1347,y
@@ -2078,129 +2284,131 @@ LB162:   lda     $6e
          and     #$07
          sta     $0f
          cmp     #$06
-         beq     @LB1B6
+         beq     @check_atk
          ldx     $07
          lda     $146e,x
          and     #$07
          cmp     $0f
-         bcc     @LB1B6
+         bcc     @check_atk
          lda     $6f
-         beq     @LB208
+         beq     @scan_def_tbl
          sta     $12
          ldx     #$00
          lda     $09
-@LB1AC:  cmp     $1346,x
-         beq     @LB174
+@check_dup:  cmp     $1346,x
+         beq     @next_entry
          inx
          dec     $12
-         bne     @LB1AC
-@LB1B6:  lda     $6f
-         beq     @LB208
+         bne     @check_dup
+@check_atk:  lda     $6f
+         beq     @scan_def_tbl
          sta     $12
          ldx     #$00
-@LB1BE:  lda     $13c6,x
+@atk_loop:  lda     $13c6,x
          and     #$7f
          cmp     $08
-         bne     @LB203
+         bne     @atk_next
          lda     $1346,x
          and     #$7f
          cmp     $09
-         beq     @LB203
+         beq     @atk_next
          sta     $0a
          tay
          lda     $146e,y
          and     #$07
          cmp     $0f
-         bcs     @LB203
+         bcs     @atk_next
          lda     $6e
          eor     #$ff
          clc
          adc     #$80
          sta     $0d
          ldy     #$7f
-@LB1E7:  lda     $13c6,y
+@def_check:  lda     $13c6,y
          and     #$7f
          cmp     $07
-         bne     @LB1F9
+         bne     @def_next
          lda     $1346,y
          and     #$7f
          cmp     $0a
-         beq     @LB203
-@LB1F9:  dey
+         beq     @atk_next
+@def_next:  dey
          dec     $0d
-         bne     @LB1E7
+         bne     @def_check
          lda     #$00
          sta     $1346,x
-@LB203:  inx
+@atk_next:  inx
          dec     $12
-         bne     @LB1BE
-@LB208:  lda     $6e
+         bne     @atk_loop
+@scan_def_tbl:  lda     $6e
          eor     #$ff
          clc
          adc     #$80
          sta     $12
          ldx     #$7f
-@LB213:  lda     $13c6,x
+@def_loop:  lda     $13c6,x
          and     #$7f
          cmp     $08
-         bne     @LB26E
+         bne     @def_next2
          lda     $1346,x
          and     #$7f
          cmp     $07
-         beq     @LB26E
+         beq     @def_next2
          sta     $0a
          tay
          lda     $0f
          cmp     #$06
-         beq     @LB24A
+         beq     @check_atk2
          lda     $146e,y
          and     #$07
          cmp     $0f
-         bcs     @LB26E
+         bcs     @def_next2
          lda     $1345,x
-         bpl     @LB24A
+         bpl     @check_atk2
          and     #$7f
          tay
          lda     $146e,y
          and     #$07
          cmp     $0f
-         bcc     @LB269
-         bcs     @LB26E
+         bcc     @remove_def
+         bcs     @def_next2
 
-@LB24A:  lda     $6f
-         beq     @LB269
+@check_atk2:  lda     $6f
+         beq     @remove_def
          sta     $0d
          ldy     #$00
-@LB252:  lda     $13c6,y
+@atk_loop2:  lda     $13c6,y
          and     #$7f
          cmp     $07
-         bne     @LB264
+         bne     @atk_next2
          lda     $1346,y
          and     #$7f
          cmp     $0a
-         beq     @LB26E
-@LB264:  iny
+         beq     @def_next2
+@atk_next2:  iny
          dec     $0d
-         bne     @LB252
-@LB269:  lda     #$00
+         bne     @atk_loop2
+@remove_def:  lda     #$00
          sta     $1346,x
-@LB26E:  dex
+@def_next2:  dex
          dec     $12
-         bne     @LB213
+         bne     @def_loop
          ldy     $11
-         jmp     @LB174
+         jmp     @next_entry
 
-LB278:   lda     $0a
+; Build the static exchange evaluation (SEE) table at $1319
+; Collects all attackers/defenders of a target square, ordered by piece value
+build_exchange_tbl:   lda     $0a
          sta     $10
          ldx     #$0e
          lda     #$00
          sta     $05
          sta     $06
-@LB284:  sta     $1319,x
+@clear_loop:  sta     $1319,x
          dex
-         bne     @LB284
+         bne     @clear_loop
          sta     $0f
-@LB28C:  lda     $08
+@process:  lda     $08
          ora     #$80
          sta     $1346,y
          lda     $13c6,y
@@ -2208,65 +2416,68 @@ LB278:   lda     $0a
          and     #$7f
          tax
          lda     $146e,x
-         bmi     @LB2A6
+         bmi     @black_off
          ldx     #$00
          inc     $05
-         bne     @LB2AA
-@LB2A6:  ldx     #$07
+         bne     @set_type
+@black_off:  ldx     #$07
          inc     $06
-@LB2AA:  and     #$07
+@set_type:  and     #$07
          sta     $0d
          lda     $07
-         bpl     @LB2B8
+         bpl     @white_off
          txa
          clc
          adc     #$06
-         bne     @LB2BC
-@LB2B8:  txa
+         bne     @find_slot
+@white_off:  txa
          clc
          adc     $0d
-@LB2BC:  tax
-@LB2BD:  lda     $1319,x
-         beq     @LB2D0
+@find_slot:  tax
+@slot_loop:  lda     $1319,x
+         beq     @store
          and     #$f0
-         beq     @LB2C9
+         beq     @pack_hi
          inx
-         bne     @LB2BD
-@LB2C9:  lda     $1319,x
+         bne     @slot_loop
+@pack_hi:  lda     $1319,x
          asl     A
          asl     A
          asl     A
          asl     A
-@LB2D0:  ora     $0d
+@store:  ora     $0d
          sta     $1319,x
          lda     $0f
-         beq     @LB2E8
-@LB2D9:  lda     $08
-@LB2DB:  dec     $10
-         beq     @LB304
+         beq     @next_def
+@next_atk:  lda     $08
+@dec_count:  dec     $10
+         beq     @done
          iny
          cmp     $1346,y
-         bne     @LB2DB
-         jmp     @LB28C
+         bne     @dec_count
+         jmp     @process
 
-@LB2E8:  lda     $08
-@LB2EA:  dec     $10
-         bne     @LB2FB
+@next_def:  lda     $08
+@dec_def:  dec     $10
+         bne     @prev_def
          lda     $6f
          sta     $10
          ldy     #$ff
          inc     $0f
          inc     $10
-         jmp     @LB2D9
+         jmp     @next_atk
 
-@LB2FB:  dey
+@prev_def:  dey
          cmp     $1346,y
-         bne     @LB2EA
-         jmp     @LB28C
+         bne     @dec_def
+         jmp     @process
 
-@LB304:  rts
+@done:  rts
 
-LB305:   ldx     $08
+; Static exchange evaluation (SEE) for target square $08
+; Simulates the capture sequence to determine material gain/loss
+; Returns result in A (relative to $80 as zero point)
+static_exchange_eval:   ldx     $08
          lda     $146e,x
          sta     $13
          and     #$07
@@ -2283,54 +2494,54 @@ LB305:   ldx     $08
          tax
          ldy     #$07
          lda     $13
-         bpl     @LB32A
+         bpl     @eval_loop
          inc     $12
-@LB32A:  jsr     @LB36E
-         beq     @LB35C
+@eval_loop:  jsr     @get_next
+         beq     @atk_done
          eor     #$ff
          adc     #$01
          clc
          adc     $0e
          sta     $0e
          cmp     $0f
-         bcc     @LB344
+         bcc     @try_defend
          lda     $0e
          sta     $0f
          lda     $0d
          sta     $11
-@LB344:  jsr     @LB36E
-         beq     @LB365
+@try_defend:  jsr     @get_next
+         beq     @def_done
          adc     $0e
          sta     $0e
          cmp     $0d
-         bcs     @LB32A
+         bcs     @eval_loop
          lda     $0e
          sta     $0d
          lda     $0f
          sta     $10
-         jmp     @LB32A
+         jmp     @eval_loop
 
-@LB35C:  lda     $0f
+@atk_done:  lda     $0f
          cmp     $11
-         bcc     @LB364
+         bcc     @done
          lda     $11
-@LB364:  rts
+@done:  rts
 
-@LB365:  lda     $0d
+@def_done:  lda     $0d
          cmp     $10
-         bcs     @LB36D
+         bcs     @done2
          lda     $10
-@LB36D:  rts
+@done2:  rts
 
-@LB36E:  lda     $12
-         bne     @LB38B
+@get_next:  lda     $12
+         bne     @get_atk
          inc     $12
          lda     $06
-         beq     @LB3AE
+         beq     @empty
          dec     $06
-@LB37A:  iny
+@find_def:  iny
          lda     $1319,y
-         beq     @LB37A
+         beq     @find_def
          pha
          lsr     A
          lsr     A
@@ -2338,14 +2549,14 @@ LB305:   ldx     $08
          lsr     A
          sta     $1319,y
          dey
-         bne     @LB3A2
-@LB38B:  dec     $12
+         bne     @unpack
+@get_atk:  dec     $12
          lda     $05
-         beq     @LB3AE
+         beq     @empty
          dec     $05
-@LB393:  inx
+@find_atk:  inx
          lda     $1319,x
-         beq     @LB393
+         beq     @find_atk
          pha
          lsr     A
          lsr     A
@@ -2353,99 +2564,104 @@ LB305:   ldx     $08
          lsr     A
          sta     $1319,x
          dex
-@LB3A2:  pla
+@unpack:  pla
          and     #$0f
          sty     $14
          tay
          lda     la634+223,y
          ldy     $14
          clc
-@LB3AE:  rts
+@empty:  rts
 
-LB3AF:   inc     $70
-         bne     @LB3BB
+; Full position evaluation (Sargon's POINTS routine)
+; Evaluates: material balance ($6A), exchange values on each square,
+; pawn structure ($6B), king safety, piece mobility, positional bonuses
+; Output: $61/$62 = evaluation score (lo/hi), $62+$80 = final score
+; $70/$71 = node counter (16-bit, for search depth control)
+evaluate_position:   inc     $70
+         bne     @init_vars
          inc     $71
-         bne     @LB3BB
+         bne     @init_vars
          dec     $70
          dec     $71
-@LB3BB:  lda     #$00
+@init_vars:  lda     #$00
          ldx     #$08
-@LB3BF:  sta     $61,x
+@zero_loop:  sta     $61,x
          dex
-         bpl     @LB3BF
-         jsr     LB00F
-         jsr     LB162
+         bpl     @zero_loop
+         jsr     build_attack_table
+         jsr     prune_illegal
          lda     $6e
          eor     #$ff
          clc
          adc     #$80
-         beq     @LB437
+         beq     @skip_king_eval
          sta     $0a
          ldy     #$7f
-@LB3D7:  lda     $1346,y
-         bmi     @LB42A
-         beq     @LB42A
+@piece_loop:  lda     $1346,y
+         bmi     @next_piece
+         beq     @next_piece
          sta     $08
          sty     $09
-         jsr     LB278
-         jsr     LB305
+         jsr     build_exchange_tbl
+         jsr     static_exchange_eval
          sec
          sbc     #$80
-         bmi     @LB428
-         beq     @LB406
+         bmi     @restore_y
+         beq     @check_king_sq
          sta     $0d
          lda     $13
          eor     next_color
-         bmi     @LB410
+         bmi     @enemy_exchange
          lda     $0d
          cmp     $63
-         bcc     @LB3FF
+         bcc     @update_max
          sta     $63
-@LB3FF:  lda     $67
+@update_max:  lda     $67
          sec
          sbc     #$08
          sta     $67
-@LB406:  lda     $08
+@check_king_sq:  lda     $08
          cmp     $0c
-         bne     @LB428
+         bne     @restore_y
          sta     $66
-         beq     @LB428
+         beq     @restore_y
 
-@LB410:  lda     $0d
+@enemy_exchange:  lda     $0d
          cmp     $64
-         bcc     @LB41B
+         bcc     @update_2nd
          ldx     $64
          sta     $64
          txa
-@LB41B:  cmp     $65
-         bcc     @LB421
+@update_2nd:  cmp     $65
+         bcc     @king_safety
          sta     $65
-@LB421:  lda     $67
+@king_safety:  lda     $67
          clc
          adc     #$04
          sta     $67
-@LB428:  ldy     $09
-@LB42A:  dey
+@restore_y:  ldy     $09
+@next_piece:  dey
          dec     $0a
-         bne     @LB3D7
+         bne     @piece_loop
          lda     $66
-         beq     @LB437
+         beq     @skip_king_eval
          lda     #$00
          sta     $65
-@LB437:  lda     level+2
-         beq     @LB43E
-         jsr     LB75C
-@LB43E:  jsr     @LB4C2
+@skip_king_eval:  lda     level+2
+         beq     @pawn_eval
+         jsr     eval_king_tropism
+@pawn_eval:  jsr     @pawn_struct
          lda     $65
          asl     $63
          sec
          sbc     $63
          bit     next_color
-         bpl     @LB451
+         bpl     @adjust_sign
          eor     #$ff
          clc
          adc     #$01
-@LB451:  clc
+@adjust_sign:  clc
          adc     $6a
          clc
          adc     $6a
@@ -2456,24 +2672,24 @@ LB3AF:   inc     $70
          clc
          adc     $67
          bit     next_color
-         bpl     @LB46A
+         bpl     @add_terms
          eor     #$ff
          clc
          adc     #$01
-@LB46A:  and     #$ff
-         jsr     @LB4A5
+@add_terms:  and     #$ff
+         jsr     @add_pos
          lda     $68
-         jsr     @LB4A5
+         jsr     @add_pos
          lda     $1e
-         jsr     @LB4A5
+         jsr     @add_pos
          lda     $1e
-         jsr     @LB4A5
+         jsr     @add_pos
          lda     $6b
-         jsr     @LB4A5
+         jsr     @add_pos
          lda     $6b
-         jsr     @LB4A5
+         jsr     @add_pos
          lda     next_color
-         bpl     @LB49D
+         bpl     @final_score
          lda     $61
          clc
          eor     #$ff
@@ -2483,33 +2699,33 @@ LB3AF:   inc     $70
          eor     #$ff
          adc     #$00
          sta     $62
-@LB49D:  lda     $62
+@final_score:  lda     $62
          clc
          adc     #$80
          sta     $62
          rts
 
-@LB4A5:  clc
-         bmi     @LB4B1
+@add_pos:  clc
+         bmi     @add_neg
          adc     $61
          sta     $61
-         bcc     @LB4B0
+         bcc     @done_pos
          inc     $62
-@LB4B0:  rts
+@done_pos:  rts
 
-@LB4B1:  adc     $61
+@add_neg:  adc     $61
          sta     $61
-         bcs     @LB4B9
+         bcs     @done_neg
          dec     $62
-@LB4B9:  rts
+@done_neg:  rts
 
-@LB4BA:  lda     #$04
-@LB4BC:  clc
-@LB4BD:  adc     $6b
+@add4_pawn:  lda     #$04
+@add_clc:  clc
+@add_pawn:  adc     $6b
          sta     $6b
          rts
 
-@LB4C2:  lda     #$00
+@pawn_struct:  lda     #$00
          sta     $0e
          sta     $11
          sta     $12
@@ -2517,174 +2733,174 @@ LB3AF:   inc     $70
          sta     $0f
          sta     $10
          ldx     #$1f
-@LB4D2:  lda     #$06
+@file_loop:  lda     #$06
          sta     $0d
-@LB4D6:  lda     $146e,x
+@rank_loop:  lda     $146e,x
          and     #$07
          cmp     #$01
-         bne     @LB502
+         bne     @advance_sq
          lda     $146e,x
-         bmi     @LB4F4
+         bmi     @black_pawn
          lda     $11
-         beq     @LB4ED
+         beq     @white_pawn
          lda     #$fc
-         jsr     @LB4BC
-@LB4ED:  lda     $0d
+         jsr     @add_clc
+@white_pawn:  lda     $0d
          sta     $11
-         jmp     @LB502
+         jmp     @advance_sq
 
-@LB4F4:  lda     $12
-         beq     @LB4FE
-         jsr     @LB4BA
-         jmp     @LB502
+@black_pawn:  lda     $12
+         beq     @first_black
+         jsr     @add4_pawn
+         jmp     @advance_sq
 
-@LB4FE:  lda     $0d
+@first_black:  lda     $0d
          sta     $12
-@LB502:  txa
+@advance_sq:  txa
          clc
          adc     #$0a
          tax
          dec     $0d
-         bne     @LB4D6
+         bne     @rank_loop
          lda     $12
-         bne     @LB562
+         bne     @no_wp
          lda     $11
-         beq     @LB55B
+         beq     @check_bp
          lda     $0e
          ora     #$40
          sta     $0e
-         jsr     @LB4BA
+         jsr     @add4_pawn
          lda     move_number
          cmp     #$14
-         bcc     @LB532
+         bcc     @check_adj_w
          lda     #$07
          sec
          sbc     $11
          tay
          lda     #$00
          sec
-@LB52B:  rol     A
+@shift_loop:  rol     A
          dey
-         bne     @LB52B
-         jsr     @LB4BD
-@LB532:  lda     $10
-         beq     @LB54D
+         bne     @shift_loop
+         jsr     @add_pawn
+@check_adj_w:  lda     $10
+         beq     @check_pass_w
          cmp     $11
-         beq     @LB548
+         beq     @adj_bonus
          sec
          sbc     #$01
          cmp     $11
-         beq     @LB548
+         beq     @adj_bonus
          clc
          adc     #$02
          cmp     $11
-         bne     @LB54D
-@LB548:  lda     #$02
-         jsr     @LB4BC
-@LB54D:  lda     $0f
-         beq     @LB555
+         bne     @check_pass_w
+@adj_bonus:  lda     #$02
+         jsr     @add_clc
+@check_pass_w:  lda     $0f
+         beq     @isolated_w
          cmp     $11
-         bcc     @LB55B
-@LB555:  lda     $0e
+         bcc     @check_bp
+@isolated_w:  lda     $0e
          ora     #$80
          sta     $0e
-@LB55B:  lda     $0f
-         beq     @LB562
-         jsr     @LB4BA
-@LB562:  lda     $11
-         bne     @LB5B8
+@check_bp:  lda     $0f
+         beq     @no_wp
+         jsr     @add4_pawn
+@no_wp:  lda     $11
+         bne     @opp_file
          lda     $12
-         beq     @LB5AF
+         beq     @check_opp
          lda     $0e
          ora     #$10
          sta     $0e
          lda     #$fc
-         jsr     @LB4BC
+         jsr     @add_clc
          lda     move_number
          cmp     #$14
-         bcc     @LB588
+         bcc     @check_adj_b
          lda     #$ff
          ldy     $12
-@LB57F:  dey
-         beq     @LB585
+@shift_bk:  dey
+         beq     @add_bk_pen
          asl     A
-         bne     @LB57F
-@LB585:  jsr     @LB4BC
-@LB588:  lda     $0f
-         beq     @LB5A3
+         bne     @shift_bk
+@add_bk_pen:  jsr     @add_clc
+@check_adj_b:  lda     $0f
+         beq     @check_pass_b
          cmp     $12
-         beq     @LB59E
+         beq     @adj_bonus_b
          clc
          adc     #$01
          cmp     $12
-         beq     @LB59E
+         beq     @adj_bonus_b
          sec
          sbc     #$02
          cmp     $12
-         bne     @LB5A3
-@LB59E:  lda     #$fe
-         jsr     @LB4BC
-@LB5A3:  lda     $12
+         bne     @check_pass_b
+@adj_bonus_b:  lda     #$fe
+         jsr     @add_clc
+@check_pass_b:  lda     $12
          cmp     $10
-         bcc     @LB5AF
+         bcc     @check_opp
          lda     $0e
          ora     #$20
          sta     $0e
-@LB5AF:  lda     $10
-         beq     @LB5B8
+@check_opp:  lda     $10
+         beq     @opp_file
          lda     #$fc
-         jsr     @LB4BC
-@LB5B8:  lda     $0e
+         jsr     @add_clc
+@opp_file:  lda     $0e
          and     #$04
-         beq     @LB5EA
+         beq     @iso_check
          lda     $11
-         beq     @LB5D9
+         beq     @check_semi
          cmp     $10
-         beq     @LB5D4
+         beq     @adj_bonus_o
          clc
          adc     #$01
          cmp     $10
-         beq     @LB5D4
+         beq     @adj_bonus_o
          sec
          sbc     #$02
          cmp     $10
-         bne     @LB5D9
-@LB5D4:  lda     #$02
-         jsr     @LB4BC
-@LB5D9:  lda     $0e
+         bne     @check_semi
+@adj_bonus_o:  lda     #$02
+         jsr     @add_clc
+@check_semi:  lda     $0e
          and     #$08
-         beq     @LB5EA
+         beq     @iso_check
          lda     $12
-         beq     @LB5E7
+         beq     @semi_bonus
          cmp     $10
-         bcc     @LB5EA
-@LB5E7:  jsr     @LB4BA
-@LB5EA:  lda     $0e
+         bcc     @iso_check
+@semi_bonus:  jsr     @add4_pawn
+@iso_check:  lda     $0e
          and     #$01
-         beq     @LB61C
+         beq     @swap_sides
          lda     $12
-         beq     @LB60B
+         beq     @check_open
          cmp     $0f
-         beq     @LB606
+         beq     @iso_penalty
          clc
          adc     #$ff
          cmp     $0f
-         beq     @LB606
+         beq     @iso_penalty
          clc
          adc     #$02
          cmp     $0f
-         bne     @LB60B
-@LB606:  lda     #$fe
-         jsr     @LB4BC
-@LB60B:  lda     $0e
+         bne     @check_open
+@iso_penalty:  lda     #$fe
+         jsr     @add_clc
+@check_open:  lda     $0e
          and     #$02
-         beq     @LB61C
+         beq     @swap_sides
          lda     $0f
          cmp     $11
-         bcc     @LB61C
+         bcc     @swap_sides
          lda     #$fc
-         jsr     @LB4BC
-@LB61C:  lda     $0e
+         jsr     @add_clc
+@swap_sides:  lda     $0e
          lsr     A
          lsr     A
          lsr     A
@@ -2702,216 +2918,223 @@ LB3AF:   inc     $70
          sbc     #$3b
          tax
          cmp     #$27
-         bne     @LB63E
-         jmp     @LB5B8
+         bne     @check_end
+         jmp     @opp_file
 
-@LB63E:  cmp     #$ec
-         bne     @LB643
+@check_end:  cmp     #$ec
+         bne     @next_file
          rts
 
-@LB643:  jmp     @LB4D2
+@next_file:  jmp     @file_loop
 
-LB646:   lda     $13
+; Evaluate positional bonus for the current move
+; Adds bonuses/penalties for: pawn advancement, piece development,
+; center control, king castling, 7th rank occupation, etc.
+; Adjusts the $1E positional accumulator
+eval_positional:   lda     $13
          and     #$07
          cmp     #$01
-         bne     @LB6C4
+         bne     @not_pawn
          lda     move_number
          cmp     #$0a
-         bcs     @LB681
+         bcs     @midgame
          lda     $0b
          bit     $13
-         bpl     @LB65D
+         bpl     @check_center
          sec
          sbc     #$32
-@LB65D:  cmp     #$22
-         beq     @LB671
+@check_center:  cmp     #$22
+         beq     @check_advance
          cmp     #$23
-         beq     @LB671
+         beq     @check_advance
          lda     $0d
          and     #$20
-         beq     @LB66C
+         beq     @retreat_pen
          rts
 
-@LB66C:  lda     #$f8
-         jmp     @LB73C
+@retreat_pen:  lda     #$f8
+         jmp     @set_bonus
 
-@LB671:  sec
+@check_advance:  sec
          sbc     $0c
          cmp     #$ec
-         beq     @LB67C
+         beq     @advance_bonus
          cmp     #$e2
-         bne     @LB6C3
-@LB67C:  lda     #$04
-         jmp     @LB73C
+         bne     @done
+@advance_bonus:  lda     #$04
+         jmp     @set_bonus
 
-@LB681:  cmp     #$19
-         bcs     @LB6C3
+@midgame:  cmp     #$19
+         bcs     @done
          lda     $13
-         bmi     @LB69F
+         bmi     @bk_pos
          lda     $6c
          cmp     #$1a
-         bcc     @LB697
+         bcc     @wk_safe
          cmp     #$1d
-         bcs     @LB6C3
+         bcs     @done
          lda     #$00
-         beq     @LB6B3
+         beq     @verify_castle
 
-@LB697:  cmp     #$18
-         bcs     @LB6C3
+@wk_safe:  cmp     #$18
+         bcs     @done
          lda     #$05
-         bne     @LB6B3
+         bne     @verify_castle
 
-@LB69F:  lda     $6d
+@bk_pos:  lda     $6d
          cmp     #$60
-         bcc     @LB6A9
+         bcc     @bk_safe
          lda     #$ce
-         bne     @LB6B3
+         bne     @verify_castle
 
-@LB6A9:  cmp     #$5e
-         bcs     @LB6C3
+@bk_safe:  cmp     #$5e
+         bcs     @done
          cmp     #$5b
-         bcc     @LB6C3
+         bcc     @done
          lda     #$d3
-@LB6B3:  clc
+@verify_castle:  clc
          adc     $0b
          cmp     #$27
-         bcs     @LB6C3
+         bcs     @done
          cmp     #$24
-         bcc     @LB6C3
+         bcc     @done
          lda     #$f4
-         jmp     @LB73C
+         jmp     @set_bonus
 
-@LB6C3:  rts
+@done:  rts
 
-@LB6C4:  cmp     #$04
-         bcc     @LB6F9
+@not_pawn:  cmp     #$04
+         bcc     @minor_piece
          cmp     #$06
-         beq     @LB6D7
+         beq     @king_move
          lda     move_number
          cmp     #$07
-         bcs     @LB6C3
+         bcs     @done
          lda     #$f0
-         jmp     @LB73C
+         jmp     @set_bonus
 
-@LB6D7:  lda     $0d
-         bpl     @LB6EF
+@king_move:  lda     $0d
+         bpl     @king_early
          lda     $0c
          bit     $13
-         bpl     @LB6E4
+         bpl     @sub_king
          sec
          sbc     #$46
-@LB6E4:  sec
+@sub_king:  sec
          sbc     #$0f
          cmp     #$0c
-         beq     @LB73C
+         beq     @set_bonus
          lda     #$06
-         bne     @LB73C
+         bne     @set_bonus
 
-@LB6EF:  lda     move_number
+@king_early:  lda     move_number
          cmp     #$1e
-         bcs     @LB6C3
+         bcs     @done
          lda     #$f4
-         bne     @LB73C
+         bne     @set_bonus
 
-@LB6F9:  lda     $0d
+@minor_piece:  lda     $0d
          and     #$10
-         beq     @LB703
+         beq     @early_dev
          lda     #$0a
-         bne     @LB70D
+         bne     @store_bonus
 
-@LB703:  lda     move_number
+@early_dev:  lda     move_number
          cmp     #$09
-         bcs     @LB6C3
+         bcs     @done
          lda     #$f8
-         bne     @LB70D
+         bne     @store_bonus
 
-@LB70D:  sta     $0f
+@store_bonus:  sta     $0f
          lda     move_number
          cmp     #$0f
-         bcs     @LB73E
+         bcs     @apply_bonus
          lda     $0c
          bit     $13
-         bpl     @LB71E
+         bpl     @check_7th
          sec
          sbc     #$1e
-@LB71E:  cmp     #$2c
-         beq     @LB726
+@check_7th:  cmp     #$2c
+         beq     @on_7th
          cmp     #$2d
-         bne     @LB73E
-@LB726:  sec
+         bne     @apply_bonus
+@on_7th:  sec
          sbc     #$0a
          bit     $13
-         bpl     @LB730
+         bpl     @check_pawn
          clc
          adc     #$32
-@LB730:  tax
+@check_pawn:  tax
          lda     $146e,x
          and     #$07
          cmp     #$01
-         bne     @LB73E
+         bne     @apply_bonus
          lda     #$e8
-@LB73C:  sta     $0f
-@LB73E:  lda     $0d
+@set_bonus:  sta     $0f
+@apply_bonus:  lda     $0d
          and     #$01
-         beq     @LB750
+         beq     @check_side
          lda     $13
-         bmi     @LB754
-@LB748:  lda     $1e
+         bmi     @add_bonus
+@sub_bonus:  lda     $1e
          sec
          sbc     $0f
          sta     $1e
          rts
 
-@LB750:  lda     $13
-         bmi     @LB748
-@LB754:  lda     $1e
+@check_side:  lda     $13
+         bmi     @sub_bonus
+@add_bonus:  lda     $1e
          clc
          adc     $0f
          sta     $1e
          rts
 
-LB75C:   lda     $6c
+; Evaluate king tropism: distance between the two kings
+; In endgames, closer kings favor the side with material advantage
+; Adjusts $68 (king distance score) and clears $64 (exchange threshold)
+eval_king_tropism:   lda     $6c
          ldy     #$00
-@LB760:  cmp     #$0a
-         bcc     @LB76A
+@div10_wk:  cmp     #$0a
+         bcc     @wk_done
          iny
          sec
          sbc     #$0a
-         bne     @LB760
-@LB76A:  sta     $0d
+         bne     @div10_wk
+@wk_done:  sta     $0d
          sty     $0e
          lda     $6d
          ldy     #$00
-@LB772:  cmp     #$0a
-         bcc     @LB77C
+@div10_bk:  cmp     #$0a
+         bcc     @dist_calc
          iny
          sec
          sbc     #$0a
-         bne     @LB772
-@LB77C:  sec
+         bne     @div10_bk
+@dist_calc:  sec
          sbc     $0d
-         bmi     @LB786
+         bmi     @store_dist
          eor     #$ff
          clc
          adc     #$01
-@LB786:  sta     $0d
+@store_dist:  sta     $0d
          tya
          sec
          sbc     $0e
-         bmi     @LB793
+         bmi     @abs_rank
          eor     #$ff
          clc
          adc     #$01
-@LB793:  clc
+@abs_rank:  clc
          adc     $0d
          clc
          adc     #$0e
          sta     $0d
          ldx     #$00
          lda     $6a
-         bmi     @LB7A2
+         bmi     @get_king
          inx
-@LB7A2:  ldy     $6c,x
+@get_king:  ldy     $6c,x
          lda     #$08
          sec
          sbc     la634+260,y
@@ -2922,17 +3145,26 @@ LB75C:   lda     $6c
          asl     A
          sta     $68
          lda     $6a
-         bpl     @LB7BF
+         bpl     @sign_adj
          lda     $68
          eor     #$ff
          clc
          adc     #$01
          sta     $68
-@LB7BF:  lda     #$00
+@sign_adj:  lda     #$00
          sta     $64
          rts
 
-LB7C4:   ldy     $8d
+; =====================================================================
+; SEARCH ALGORITHM (Sargon "PLYEX" routine)
+; =====================================================================
+
+; Make a move on the internal board
+; Reads from/to from move list at ($8B),$8D
+; Updates board array, handles pawn promotion, en passant, castling
+; Records captured piece and move flags for unmake_move
+; Also calls eval_positional to update positional score
+make_move:   ldy     $8d
          lda     ($8b),y
          sta     $0b
          tax
@@ -2945,80 +3177,80 @@ LB7C4:   ldy     $8d
          sta     $146e,x
          sta     $0d
          bit     $13
-         bvs     @LB7EA
+         bvs     @check_first
          lda     #$10
          sta     $0d
          lda     $13
          ora     #$40
          sta     $13
-@LB7EA:  ldx     $0c
+@check_first:  ldx     $0c
          lda     $146e,x
          sta     $14
          lda     $13
          sta     $146e,x
          and     #$07
          cmp     #$01
-         beq     @LB82D
+         beq     @pawn_move
          cmp     #$06
-         bne     @LB803
-         jmp     @LB883
+         bne     @eval_move
+         jmp     @king_move
 
-@LB803:  jsr     LB646
+@eval_move:  jsr     eval_positional
          ldy     next_color+1
          lda     $0d
          sta     $1331,y
          lda     $14
          sta     $1327,y
-         beq     @LB82C
+         beq     @done
          and     #$07
          tax
          lda     $14
-         bpl     @LB824
+         bpl     @sub_piece
          lda     $6a
          clc
          adc     la634+223,x
          sta     $6a
          rts
 
-@LB824:  lda     $6a
+@sub_piece:  lda     $6a
          sec
          sbc     la634+223,x
          sta     $6a
-@LB82C:  rts
+@done:  rts
 
-@LB82D:  lda     $0c
+@pawn_move:  lda     $0c
          cmp     #$5b
-         bcs     @LB837
+         bcs     @not_promote
          cmp     #$1d
-         bcs     @LB856
-@LB837:  lda     $0d
+         bcs     @check_ep
+@not_promote:  lda     $0d
          ora     #$20
          sta     $0d
          lda     $146e,x
          ora     #$04
          sta     $146e,x
          sta     $13
-         bmi     @LB84C
-         lda     #$07
-         .byte   $2c
-@LB84C:  lda     #$f9
+         bmi     @black_promo
+         lda     #$07             ; white pawn promotes: +7 to material
+         .byte   $2c              ; BIT abs trick: skip next LDA
+@black_promo:  lda     #$f9             ; black pawn promotes: -7 to material
          clc
          adc     $6a
          sta     $6a
-         jmp     @LB803
+         jmp     @eval_move
 
-@LB856:  lda     $0c
+@check_ep:  lda     $0c
          sec
          sbc     $0b
          and     #$01
-         beq     @LB803
+         beq     @eval_move
          lda     $14
-         bne     @LB803
+         bne     @eval_move
          lda     $13
-         bmi     @LB86A
-         lda     #$f6
-         .byte   $2c
-@LB86A:  lda     #$0a
+         bmi     @bk_ep_sq
+         lda     #$f6             ; white en passant: captured pawn is 10 rows back
+         .byte   $2c              ; BIT abs trick: skip next LDA
+@bk_ep_sq:  lda     #$0a             ; black en passant: captured pawn is 10 rows forward
          clc
          adc     $0c
          tax
@@ -3029,31 +3261,31 @@ LB7C4:   ldy     $8d
          lda     $0d
          ora     #$40
          sta     $0d
-         jmp     @LB803
+         jmp     @eval_move
 
-@LB883:  lda     $0c
+@king_move:  lda     $0c
          ldx     $13
-         bmi     @LB88C
-         sta     $6c
-         .byte   $2c
-@LB88C:  sta     $6d
+         bmi     @bk_king
+         sta     $6c              ; update white king position
+         .byte   $2c              ; BIT abs trick: skip next STA
+@bk_king:  sta     $6d              ; update black king position
          sta     $08
          sec
          sbc     $0b
          cmp     #$02
-         beq     @LB8A3
+         beq     @queenside
          cmp     #$fe
-         bne     @LB8C4
+         bne     @king_done
          inc     $08
          asl     A
          clc
          adc     $0b
-         bne     @LB8AA
-@LB8A3:  dec     $08
+         bne     @rook_from
+@queenside:  dec     $08
          clc
          adc     $0b
          adc     #$01
-@LB8AA:  tax
+@rook_from:  tax
          lda     $146e,x
          sta     $10
          lda     #$00
@@ -3065,9 +3297,11 @@ LB7C4:   ldy     $8d
          lda     $0d
          ora     #$80
          sta     $0d
-@LB8C4:  jmp     @LB803
+@king_done:  jmp     @eval_move
 
-LB8C7:   ldy     $8d
+; Unmake the last move: restore board state, piece positions, material
+; Reverses everything done by make_move (promotion, EP, castling)
+unmake_move:   ldy     $8d
          lda     ($8b),y
          sta     $0b
          iny
@@ -3083,95 +3317,95 @@ LB8C7:   ldy     $8d
          lda     $1331,y
          sta     $0d
          and     #$10
-         beq     @LB8F1
+         beq     @restore_from
          lda     $13
          and     #$bf
          sta     $13
-@LB8F1:  ldx     $0b
+@restore_from:  ldx     $0b
          lda     $13
          sta     $146e,x
          and     #$07
          cmp     #$01
-         beq     @LB942
+         beq     @undo_ep
          cmp     #$06
-         beq     @LB962
+         beq     @undo_king
          lda     $0d
          and     #$20
-         bne     @LB92A
-@LB908:  inc     $0d
-         jsr     LB646
+         bne     @undo_promo
+@undo_eval:  inc     $0d
+         jsr     eval_positional
          lda     $14
-         beq     @LB929
+         beq     @done
          and     #$07
          tax
          lda     $14
-         bmi     @LB921
+         bmi     @sub_piece
          lda     $6a
          clc
          adc     la634+223,x
          sta     $6a
          rts
 
-@LB921:  lda     $6a
+@sub_piece:  lda     $6a
          sec
          sbc     la634+223,x
          sta     $6a
-@LB929:  rts
+@done:  rts
 
-@LB92A:  lda     $13
+@undo_promo:  lda     $13
          and     #$fb
          sta     $13
          sta     $146e,x
-         bpl     @LB938
-         lda     #$07
-         .byte   $2c
-@LB938:  lda     #$f9
+         bpl     @bk_promo
+         lda     #$07             ; undo white promotion: -7 material
+         .byte   $2c              ; BIT abs trick: skip next LDA
+@bk_promo:  lda     #$f9             ; undo black promotion: +7 material
          clc
          adc     $6a
          sta     $6a
-         jmp     @LB908
+         jmp     @undo_eval
 
-@LB942:  bit     $0d
-         bvc     @LB908
+@undo_ep:  bit     $0d
+         bvc     @undo_eval
          ldx     $0c
          lda     #$00
          sta     $146e,x
          lda     $13
-         bmi     @LB954
-         lda     #$f6
-         .byte   $2c
-@LB954:  lda     #$0a
+         bmi     @bk_ep
+         lda     #$f6             ; white: restore ep pawn 10 rows back
+         .byte   $2c              ; BIT abs trick: skip next LDA
+@bk_ep:  lda     #$0a             ; black: restore ep pawn 10 rows forward
          clc
          adc     $0c
          tax
          lda     $14
          sta     $146e,x
-         jmp     @LB908
+         jmp     @undo_eval
 
-@LB962:  ldx     $0b
+@undo_king:  ldx     $0b
          lda     $13
-         bmi     @LB96B
-         stx     $6c
-         .byte   $2c
-@LB96B:  stx     $6d
+         bmi     @bk_king
+         stx     $6c              ; restore white king position
+         .byte   $2c              ; BIT abs trick: skip next STX
+@bk_king:  stx     $6d              ; restore black king position
          lda     $0d
-         bpl     @LB908
+         bpl     @undo_eval
          lda     $0c
          sta     $08
          sec
          sbc     $0b
          cmp     #$02
-         beq     @LB984
+         beq     @queenside
          inc     $08
          asl     A
          clc
          adc     $0b
-         bne     @LB98B
-@LB984:  dec     $08
+         bne     @rook_dest
+@queenside:  dec     $08
          clc
          adc     $0b
          adc     #$01
-@LB98B:  sta     $07
+@rook_dest:  sta     $07
          ldx     $08
          lda     $146e,x
          and     #$bf
@@ -3181,33 +3415,36 @@ LB8C7:   ldy     $8d
          ldx     $07
          lda     $10
          sta     $146e,x
-         jmp     @LB908
+         jmp     @undo_eval
 
-LB9A5:   ldy     next_color+1
+; Sort the move list by priority (selection sort)
+; Captures and moves to important squares are prioritized
+; Uses piece value and target square to calculate sort key
+sort_moves:   ldy     next_color+1
          lda     $1445,y
          sta     $07
          lda     $144f,y
          sta     $08
          ldy     #$00
-@LB9B3:  lda     ($8b),y
-         beq     @LBA05
+@outer_loop:  lda     ($8b),y
+         beq     @done
          sty     $0f
-         jsr     @LBA06
-@LB9BC:  lda     $11
+         jsr     @calc_priority
+@save_best:  lda     $11
          sta     $12
          sty     $10
-@LB9C2:  iny
+@inner_loop:  iny
          iny
          lda     ($8b),y
-         beq     @LB9D3
-         jsr     @LBA06
+         beq     @end_pass
+         jsr     @calc_priority
          lda     $12
          cmp     $11
-         bcs     @LB9C2
-         bcc     @LB9BC
+         bcs     @inner_loop
+         bcc     @save_best
 
-@LB9D3:  lda     $12
-         beq     @LBA05
+@end_pass:  lda     $12
+         beq     @done
          ldy     $0f
          lda     ($8b),y
          sta     $11
@@ -3232,11 +3469,11 @@ LB9A5:   ldy     next_color+1
          lda     $0e
          sta     ($8b),y
          iny
-         jmp     @LB9B3
+         jmp     @outer_loop
 
-@LBA05:  rts
+@done:  rts
 
-@LBA06:  iny
+@calc_priority:  iny
          lda     ($8b),y
          dey
          tax
@@ -3245,56 +3482,61 @@ LB9A5:   ldy     next_color+1
          asl     A
          asl     A
          sta     $11
-         bne     @LBA24
+         bne     @priority_done
          lda     $07
          cmp     ($8b),y
-         bne     @LBA24
+         bne     @priority_done
          inc     $11
          cpx     $08
-         bne     @LBA24
+         bne     @priority_done
          inc     $11
-@LBA24:  rts
+@priority_done:  rts
 
-LBA25:   ldy     $8d
+; PLYEX: Main alpha-beta search routine (recursive)
+; Iterates through move list, tries each move, recurses to deeper plies
+; Uses alpha-beta pruning with aspiration windows
+; At leaf nodes, calls evaluate_position for static eval
+; Score stored in $61/$62, best move tracked via store_best_move
+plyex:   ldy     $8d
          lda     ($8b),y
-         beq     @LBA45
-         jsr     LADF2
-         bcc     @LBA33
-         jmp     @LBADC
+         beq     @end_of_moves
+         jsr     try_make_move
+         bcc     @legal_move
+         jmp     @next_move
 
-@LBA33:  ldy     next_color+1
+@legal_move:  ldy     next_color+1
          cpy     level+1
-         bcs     @LBA88
-@LBA39:  jsr     @LBAEB
-         jsr     LAEC0
-         jsr     LB9A5
-         jmp     LBA25
+         bcs     @at_max_depth
+@go_deeper:  jsr     @push_ply
+         jsr     init_move_gen
+         jsr     sort_moves
+         jmp     plyex
 
-@LBA45:  lda     $1d
-         bne     @LBA68
+@end_of_moves:  lda     $1d
+         bne     @check_cutoff
          dey
          dey
          sty     $8d
-         jsr     LBBD1
-         bcc     @LBA5D
+         jsr     is_own_king_checked
+         bcc     @not_in_check
          lda     next_color+1
          sta     $61
          lda     #$00
          sta     $62
-         jmp     @LBA9C
+         jmp     @inc_count
 
-@LBA5D:  lda     #$00
+@not_in_check:  lda     #$00
          sta     $61
          lda     #$80
          sta     $62
-         jmp     @LBA9C
+         jmp     @inc_count
 
-@LBA68:  ldy     next_color+1
+@check_cutoff:  ldy     next_color+1
          cpy     #$01
-         bne     @LBA6F
+         bne     @go_back
          rts
 
-@LBA6F:  jsr     @LBB06
+@go_back:  jsr     @pop_ply
          lda     scoreL_stack,y
          eor     #$ff
          clc
@@ -3304,31 +3546,31 @@ LBA25:   ldy     $8d
          eor     #$ff
          adc     #$00
          sta     $62
-         jmp     @LBA9E
+         jmp     @compare_score
 
-@LBA88:  jsr     LBB86
+@at_max_depth:  jsr     alpha_beta_cutoff
          lda     next_color+1
          cmp     level
-         bcc     @LBA99
+         bcc     @undo_and_score
          cmp     level+1
-         bne     @LBA99
+         bne     @undo_and_score
          lda     $69
-         bne     @LBA39
-@LBA99:  jsr     LB8C7
-@LBA9C:  inc     $1d
-@LBA9E:  ldy     next_color+1
+         bne     @go_deeper
+@undo_and_score:  jsr     unmake_move
+@inc_count:  inc     $1d
+@compare_score:  ldy     next_color+1
          lda     $62
          cmp     $002f,y
-         bcc     @LBADC
-         bne     @LBAB0
+         bcc     @next_move
+         bne     @better_move
          lda     $0022,y
          cmp     $61
-         bcs     @LBADC
-@LBAB0:  lda     $61
+         bcs     @next_move
+@better_move:  lda     $61
          sta     $0022,y
          lda     $62
          sta     $002f,y
-         jsr     LBB41
+         jsr     store_best_move
          lda     $61
          eor     #$ff
          clc
@@ -3339,25 +3581,25 @@ LBA25:   ldy     $8d
          adc     #$00
          sta     $62
          cmp     $002e,y
-         bcc     @LBA68
-         bne     @LBADC
+         bcc     @check_cutoff
+         bne     @next_move
          lda     $0021,y
          cmp     $61
-         bcs     @LBA68
-@LBADC:  ldy     next_color+1
+         bcs     @check_cutoff
+@next_move:  ldy     next_color+1
          lda     $8d
          clc
          adc     #$02
          sta     $133b,y
          sta     $8d
-         jmp     LBA25
+         jmp     plyex
 
-@LBAEB:  lda     next_color
+@push_ply:  lda     next_color
          eor     #$80
          sta     next_color
-         bmi     @LBAF5
+         bmi     @set_ply_ptrs
          inc     move_number
-@LBAF5:  ldy     next_color+1
+@set_ply_ptrs:  ldy     next_color+1
          lda     $0021,y
          sta     scoreL_stack,y
          lda     $002e,y
@@ -3365,12 +3607,12 @@ LBA25:   ldy     $8d
          inc     next_color+1
          rts
 
-@LBB06:  lda     next_color
+@pop_ply:  lda     next_color
          eor     #$80
          sta     next_color
-         bpl     @LBB10
+         bpl     @dec_ply
          dec     move_number
-@LBB10:  dec     next_color+1
+@dec_ply:  dec     next_color+1
          lda     $1459,y
          sta     $8e
          lda     $1463,y
@@ -3382,35 +3624,38 @@ LBA25:   ldy     $8d
          sta     $8c
          lda     $133b,y
          sta     $8d
-         jsr     LB8C7
+         jsr     unmake_move
          ldy     next_color+1
          cpy     #$01
-         bne     @LBB40
+         bne     @pop_done
          lda     $1fe2
          eor     #$0a
          ora     #$40
          sta     $1fe2
-@LBB40:  rts
+@pop_done:  rts
 
-LBB41:   lda     $1327,y
-         bne     @LBB50
+; Store the best move found at current ply level
+; At ply 1: updates the principal variation display
+; At ply 2: saves second-best move for hint feature
+store_best_move:   lda     $1327,y
+         bne     @check_ply
          lda     $0b
          sta     $1445,y
          lda     $0c
          sta     $144f,y
-@LBB50:  cpy     #$01
-         bne     @LBB79
+@check_ply:  cpy     #$01
+         bne     @ply2
          ldx     $8d
-         beq     @LBB6B
-@LBB58:  lda     $1000,x
+         beq     @display_pv
+@shift_pv:  lda     $1000,x
          sta     $1002,x
          dex
-         bne     @LBB58
+         bne     @shift_pv
          lda     $0b
          sta     $1001
          lda     $0c
          sta     $1002
-@LBB6B:  jsr     LACFA
+@display_pv:  jsr     display_move_full
          ldy     next_color+1
          lda     $b5
          sta     $9f
@@ -3418,24 +3663,28 @@ LBB41:   lda     $1327,y
          sta     $b4
          rts
 
-@LBB79:  cpy     #$02
-         bne     @LBB85
+@ply2:  cpy     #$02
+         bne     @done
          lda     $0b
          sta     $b5
          lda     $0c
          sta     $b6
-@LBB85:  rts
+@done:  rts
 
-LBB86:   lda     level+1
+; Determine if search should continue deeper or evaluate statically
+; Below max depth: use quick material-based eval for alpha-beta cutoff
+; At/above max depth: run full evaluate_position
+; Also checks if current side's king is in check (enables quiescence)
+alpha_beta_cutoff:   lda     level+1
          cmp     level
-         bcs     @LBBC1
+         bcs     @full_eval
          lda     $6a
          asl     A
          sta     $62
          lda     #$00
          sta     $61
          lda     next_color
-         bpl     @LBBAA
+         bpl     @adjust_sign
          lda     $61
          eor     #$ff
          clc
@@ -3445,89 +3694,99 @@ LBB86:   lda     level+1
          eor     #$ff
          adc     #$00
          sta     $62
-@LBBAA:  lda     $62
+@adjust_sign:  lda     $62
          clc
          adc     #$81
          sta     $62
          ldy     next_color+1
          cmp     $002f,y
-         bcc     @LBBC4
-         bne     @LBBC1
+         bcc     @check_in_check
+         bne     @full_eval
          lda     $0022,y
          cmp     $61
-         bcs     @LBBC4
-@LBBC1:  jmp     LB3AF
+         bcs     @check_in_check
+@full_eval:  jmp     evaluate_position
 
-@LBBC4:  lda     next_color
+@check_in_check:  lda     next_color
          eor     #$80
-         jsr     LBBD3
+         jsr     is_king_checked
          lda     #$00
          rol     A
          sta     $69
          rts
 
-LBBD1:   lda     next_color
-LBBD3:   bmi     @LBBD8
-         ldx     $6c
-         .byte   $2c
-@LBBD8:  ldx     $6d
+; Check if current side's king is in check (uses next_color)
+is_own_king_checked:   lda     next_color
+; Check if king of given color (A) is in check
+is_king_checked:   bmi     @black_king
+         ldx     $6c              ; white king position
+         .byte   $2c              ; BIT abs trick: skip next LDX
+@black_king:  ldx     $6d              ; black king position
          lda     $146e,x
          sta     $13
-         jmp     LAF7A
+         jmp     is_king_attacked
 
+; =====================================================================
+; ITERATIVE DEEPENING AND OPENING BOOK
+; =====================================================================
+
+; Main entry point for computer move calculation
+; Uses iterative deepening: searches depth 1, 2, 3... up to max level
+; Widens aspiration window on fail-high/fail-low
+; First checks opening book before starting search
 calc_move:
-         jsr     LBCE4
+         jsr     init_board_state
          lda     #$00
          sta     $1e
          sta     $70
          sta     $71
          ldx     #$0a
-@LBBEF:  sta     $1445,x
+@clear_loop:  sta     $1445,x
          sta     $144f,x
          sta     $20,x
          sta     $2d,x
          dex
-         bne     @LBBEF
+         bne     @clear_loop
          lda     #$01
          sta     $8e
          lda     #$10
          sta     $8f
          lda     #$01
          sta     level+1
-         jsr     LAEC0
+         jsr     init_move_gen
          lda     $8e
          sta     $145b
          lda     $8f
          sta     $1465
          lda     $1c
-         bne     @LBC1C
-         jsr     LBF60
-@LBC1C:  lda     level+1
+         bne     @iter_loop
+         jsr     opening_book_lookup
+@iter_loop:  lda     level+1
          ora     #$70
          sta     $1fe3
-         jsr     LBA25
+         jsr     plyex
          lda     scoreH_stack
-         beq     @LBC2E
+         beq     @done
          cmp     #$ff
-         bne     @LBC2F
-@LBC2E:  rts
+         bne     @deepen
+@done:  rts
 
-@LBC2F:  inc     level+1
+@deepen:  inc     level+1
          lda     level+1
          cmp     #$03
-         bcc     @LBC83
+         bcc     @check_depth
          cmp     level
-         bcs     @LBC3E
-         jmp     @LBCC0
+         bcs     @check_window
+         jmp     @restart_search
 
-@LBC3E:  lda     scoreH_stack
+@check_window:  lda     scoreH_stack
          cmp     $2e
-         bcc     @LBC98
-         bne     @LBC4C
+         bcc     @fail_low
+         bne     @widen_beta
          lda     $21
          cmp     scoreL_stack
-         bcs     @LBC98
-@LBC4C:  lda     scoreL_stack
+         bcs     @fail_low
+@widen_beta:  lda     scoreL_stack
          eor     #$ff
          clc
          adc     #$01
@@ -3537,12 +3796,12 @@ calc_move:
          adc     #$00
          sta     $62
          cmp     $2f
-         bcc     @LBCAC
-         bne     @LBC69
+         bcc     @fail_high
+         bne     @set_window
          lda     $22
          cmp     $61
-         bcs     @LBCAC
-@LBC69:  lda     #$e0
+         bcs     @fail_high
+@set_window:  lda     #$e0
          clc
          adc     scoreL_stack
          sta     $21
@@ -3556,18 +3815,18 @@ calc_move:
          lda     $62
          adc     #$ff
          sta     $2f
-@LBC83:  lda     level+1
+@check_depth:  lda     level+1
          cmp     #$0a
-         beq     @LBC2E
+         beq     @done
          cmp     level
-         beq     @LBCC0
+         beq     @restart_search
          ldx     level
          lda     $71
          cmp     la634+266,x
-         bcs     @LBC2E
-         bcc     @LBCC0
+         bcs     @done
+         bcc     @restart_search
 
-@LBC98:  lda     $21
+@fail_low:  lda     $21
          eor     #$ff
          sta     $22
          lda     $2e
@@ -3576,9 +3835,9 @@ calc_move:
          lda     #$00
          sta     $21
          sta     $2e
-         beq     @LBCBE
+         beq     @dec_depth
 
-@LBCAC:  lda     $22
+@fail_high:  lda     $22
          eor     #$ff
          sta     $21
          lda     $2f
@@ -3587,8 +3846,8 @@ calc_move:
          lda     #$00
          sta     $22
          sta     $2f
-@LBCBE:  dec     level+1
-@LBCC0:  lda     #$00
+@dec_depth:  dec     level+1
+@restart_search:  lda     #$00
          sta     $8d
          sta     $133c
          lda     $21
@@ -3603,57 +3862,59 @@ calc_move:
          sta     $8e
          lda     $1465
          sta     $8f
-         jmp     @LBC1C
+         jmp     @iter_loop
 
-LBCE4:   lda     #$00
+; Initialize board state: compute material balance ($6A), locate kings
+; ($6C/$6D), count total material ($07), set endgame flag (level+2)
+init_board_state:   lda     #$00
          sta     level+2
          sta     $6a
          sta     $07
          ldx     #$15
-@LBCEE:  lda     $146e,x
-         beq     @LBD27
+@piece_loop:  lda     $146e,x
+         beq     @next_sq
          cmp     #$ff
-         beq     @LBD27
+         beq     @next_sq
          sta     $13
          and     #$07
          tay
          cmp     #$06
-         bne     @LBD0A
+         bne     @add_value
          lda     $13
-         bmi     @LBD08
+         bmi     @bk_king
          stx     $6c
-         bne     @LBD0A
-@LBD08:  stx     $6d
-@LBD0A:  lda     $13
-         bmi     @LBD17
+         bne     @add_value
+@bk_king:  stx     $6d
+@add_value:  lda     $13
+         bmi     @sub_value
          lda     $6a
          clc
          adc     la634+223,y
-         jmp     @LBD1D
+         jmp     @store_bal
 
-@LBD17:  lda     $6a
+@sub_value:  lda     $6a
          sec
          sbc     la634+223,y
-@LBD1D:  sta     $6a
+@store_bal:  sta     $6a
          lda     $07
          clc
          adc     la634+223,y
          sta     $07
-@LBD27:  inx
+@next_sq:  inx
          cpx     #$63
-         bcc     @LBCEE
+         bcc     @piece_loop
          lda     $07
          cmp     #$2e
-         bcs     @LBD41
+         bcs     @done
          lda     $6a
-         bpl     @LBD3B
+         bpl     @check_endgame
          eor     #$ff
          clc
          adc     #$01
-@LBD3B:  cmp     #$05
-         bcc     @LBD41
+@check_endgame:  cmp     #$05
+         bcc     @done
          sta     level+2
-@LBD41:  rts
+@done:  rts
 
 .if      .defined(USE_VIC_BOOK_FIX)
     .include "sargon_2_vic20_book_fix.S"
@@ -3665,63 +3926,67 @@ LBCE4:   lda     #$00
     .error "No openings book defined. Please define one of the USE_* flags."
 .endif
 
-LBF60:   lsr     $9c
+; Opening book lookup: traverse the book tree to find current position
+; Book format: each node has a bitmap of children, followed by move+pointer pairs
+; $9C = last move played (halved for book encoding)
+; If found, plays a random book move; if not, sets $1C flag to stop consulting
+opening_book_lookup:   lsr     $9c
          ldy     #$00
          lda     move_number
          cmp     #$01
-         bne     @LBF76
+         bne     @search_book
          lda     #<lopenings
          sta     opening_ptr
          lda     #>lopenings
          sta     opening_ptr+1
          lda     human_color
-         beq     @LBF9C
-@LBF76:  lda     (opening_ptr),y
+         beq     @select_move
+@search_book:  lda     (opening_ptr),y
          ldx     #$01
-@LBF7A:  lsr     A
-         bcc     @LBF7E
+@count_children:  lsr     A
+         bcc     @shift_bits
          inx
-@LBF7E:  cmp     #$00
-         bne     @LBF7A
+@shift_bits:  cmp     #$00
+         bne     @count_children
          lda     $9c
          iny
-@LBF85:  cmp     (opening_ptr),y
-         beq     @LBF96
+@match_move:  cmp     (opening_ptr),y
+         beq     @found_match
          dex
-         beq     @LBF91
+         beq     @book_fail
          jsr     next_child
-         bcc     @LBF85
-@LBF91:  lda     #$50
+         bcc     @match_move
+@book_fail:  lda     #$50
          sta     $1c
          rts
 
-@LBF96:  jsr     goto_child
-         bcc     @LBF9C
+@found_match:  jsr     goto_child
+         bcc     @select_move
          rts
 
-@LBF9C:  ldy     #$00
+@select_move:  ldy     #$00
          lda     (opening_ptr),y
          ora     #$80
          sta     $0d
          iny
          lda     vic_raster
          sta     $0e
-@LBFAA:  lsr     $0e
-         bcs     @LBFBD
+@random_loop:  lsr     $0e
+         bcs     @play_move
          lda     $0d
-         beq     @LBFBB
+         beq     @use_first
          lsr     $0d
-         bcc     @LBFAA
+         bcc     @random_loop
          jsr     next_child
-         bne     @LBFAA
-@LBFBB:  ldy     #$01
-@LBFBD:  lda     (opening_ptr),y
+         bne     @random_loop
+@use_first:  ldy     #$01
+@play_move:  lda     (opening_ptr),y
          asl     A
          sta     $8d
          jsr     goto_child
-         jsr     LB7C4
-         jsr     LB8C7
-         jsr     LBB41
+         jsr     make_move
+         jsr     unmake_move
+         jsr     store_best_move
          lda     #$50
          sta     scoreH_stack
          lda     #$00
@@ -3730,11 +3995,13 @@ LBF60:   lsr     $9c
          pla
          rts
 
-goto_child:  
+; Navigate to a child node in the opening book tree
+; Reads 2-byte pointer at (opening_ptr),Y+1; $FF = end of book
+goto_child:
          iny
          lda     (opening_ptr),y
          cmp     #$ff
-         beq     @LBFED
+         beq     @end_of_book
          sta     $0d
          iny
          lda     (opening_ptr),y
@@ -3744,18 +4011,19 @@ goto_child:
          clc
          rts
 
-@LBFED:  sta     $1c
+@end_of_book:  sta     $1c
          sec
          rts
 
+; Skip to the next sibling node in the opening book tree
 next_child:
          sta     $0f
          iny
          lda     (opening_ptr),y
          cmp     #$ff
-         beq     @LBFFB
+         beq     @skip_ptr
          iny
-@LBFFB:  iny
+@skip_ptr:  iny
          lda     $0f
          clc
          rts
