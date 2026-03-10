@@ -22,6 +22,30 @@ k_out_to_channel = $ffd2
 k_getchar =      $ffe4
 k_cursor_pos =   $fff0
 
+; Core board/search structures in RAM.
+board_cells =    $146e
+move_list_base = $1000
+move_history =   $12fe
+ply_move_ptr_l = $1459
+ply_move_ptr_h = $1463
+ply_best_from =  $1445
+ply_best_to =    $144f
+ply_move_flags = $1331
+ply_captured =   $1327
+ply_next_index = $133b
+king_square_w =  $6c
+king_square_b =  $6d
+material_score = $6a
+
+; `engine_lookup_tables` offsets used by the engine core.
+initial_piece_order = la634+216
+piece_value_table =   la634+223
+piece_dir_start =     la634+229
+piece_dir_count =     la634+235
+direction_delta =     la634+242
+square_weight_table = la634+260
+depth_node_limit =    la634+266
+
          .org    $2000          ; original $a000
 
 ;--- PATCH (9 bytes) ---
@@ -46,15 +70,22 @@ k_cursor_pos =   $fff0
 .endif
 ;--- END OF ORIGINAL ---
 
+; Clear VIC text screen and home cursor.
+screen_clear_and_home:
 LA009:   lda     #$93
          jmp     k_out_to_channel
 
+; Reset move-entry panel and place cursor at the move prompt.
+reset_input_panel_and_cursor:
 LA00E:   jsr     LA019
+set_input_cursor:
 LA011:   clc
          ldx     #$07
          ldy     #$06
          jmp     k_cursor_pos
 
+; Clear board UI area in screen RAM and color RAM.
+clear_board_display_area:
 LA019:   jsr     LA009
          lda     #$a0
          ldx     #$fd
@@ -64,6 +95,8 @@ LA019:   jsr     LA009
          bne     @LA020
          rts
 
+; Redraw the 16 move-entry cells (A1-A8 style panel).
+redraw_input_panel:
 LA02A:   pha
          ldx     #$03
 @LA02D:  lda     @LA06A,x
@@ -105,6 +138,8 @@ LA02A:   pha
          .byte   $27
          .byte   $1e
 
+; Clear the typed move cells.
+clear_input_cells:
 LA06E:   ldy     #$04
 @LA070:  lda     #$60
          sta     $1f5b,y
@@ -114,6 +149,8 @@ LA06E:   ldy     #$04
          bpl     @LA070
          rts
 
+; Visual blink used before input loops.
+flash_input_panel:
 LA07E:   lda     #$0f
          sta     $00
 @LA082:  jsr     LA09E
@@ -121,6 +158,8 @@ LA07E:   lda     #$0f
          bne     @LA082
          rts
 
+; Add one character to the move-entry strip.
+push_input_char:
 LA08A:   ldx     $f9
          cmp     #$0d
          beq     LA09E
@@ -130,17 +169,24 @@ LA08A:   ldx     $f9
          jsr     LA09E
 @LA098:  jmp     LA152
 
+; Print a string into the entry strip and reset cursor/index state.
+render_prompt_and_reset_input:
 LA09B:   jsr     LAD12
+reset_input_panel:
 LA09E:   jsr     LA02A
          ldx     #$00
          stx     $f9
          rts
 
+; Read a move string from keyboard/joystick control input.
+read_move_text_input:
 LA0A6:   ldx     #$00
          stx     $f9
          stx     $1f
+clear_input_buffer_state:
 LA0AC:   ldx     #$00
          stx     $00
+read_move_text_loop:
 LA0B0:   jsr     LA0F6
          pha
          lda     $f9
@@ -167,16 +213,20 @@ LA0B0:   jsr     LA0F6
          jmp     LA0B0
 
 @LA0E2:  jsr     LA12C
+input_accept_return_first_char:
 LA0E5:   ldx     #$00
          stx     $f9
          lda     $033c
          rts
 
+handle_backspace_in_input:
 LA0ED:   jsr     LA12C
          dec     $00
          bmi     LA0AC
          bpl     LA0B0
 
+; Poll keyboard; if idle, poll joystick/cursor controls.
+poll_keyboard_or_joystick:
 LA0F6:   jsr     k_getchar
          bne     @LA105
          jsr     LA1CF
@@ -189,12 +239,14 @@ LA0F6:   jsr     k_getchar
          bne     @LA104
          jmp     LAD38
 
+wait_for_key:
 LA10C:   jsr     k_getchar
          beq     LA10C
          rts
 
 input:   jsr     input_string
          jsr     LA10C
+echo_key_and_cr:
 LA118:   pha
          ora     #$80
          jsr     k_out_to_channel
@@ -203,9 +255,11 @@ LA118:   pha
          pla
          rts
 
+append_input_char:
 LA125:   ldy     $00
          inc     $00
          sta     $033c,y
+update_input_cursor:
 LA12C:   ldx     $f9
          cmp     #$14
          beq     @LA13C
@@ -230,6 +284,7 @@ LA12C:   ldx     $f9
          stx     $f9
          rts
 
+draw_input_cell:
 LA152:   stx     $f9
          ora     #$40
          sta     $1f5a,x
@@ -239,6 +294,8 @@ LA152:   stx     $f9
          pla
          rts
 
+; Short click/beep with fixed delay.
+beep_and_delay:
 LA161:   stx     $900b
          ldx     #$80
          ldy     #$80
@@ -249,6 +306,8 @@ LA161:   stx     $900b
          sty     $900b
          rts
 
+; Alternate move entry driven by cursor keys/joystick matrix.
+read_move_via_cursor_controls:
 LA172:   ldx     #$36
 @LA174:  stx     $07
 @LA176:  jsr     LA210
@@ -294,6 +353,8 @@ LA172:   ldx     #$36
          sta     $0200,y
          jmp     LA12C
 
+; Read one control key from VIA keyboard/joystick matrix.
+read_cursor_control_key:
 LA1CF:   sei
          ldx     #$7f
          stx     $9122
@@ -335,6 +396,8 @@ LA1CF:   sei
          .byte   $9d
          .byte   $0d
 
+; Show piece under current board cursor.
+preview_square_piece:
 LA210:   lda     $07
          jsr     LA311
          lda     $033c
@@ -345,6 +408,8 @@ LA210:   lda     $07
          jsr     LA25E
          rts
 
+; Apply a cursor-direction key and keep cursor on valid board squares.
+move_board_cursor:
 LA225:   ldy     #$08
          ldx     #$ff
          cmp     #$9d
@@ -378,7 +443,10 @@ LA225:   ldy     #$08
          tax
 @LA25B:  rts
 
+; Blink helper: default 16 toggles or A toggles when called via LA25E.
+blink_selected_square_default:
 LA25C:   lda     #$10
+blink_selected_square:
 LA25E:   sta     $a8
 @LA260:  jsr     LA3B2
          ldy     #$30
@@ -390,6 +458,8 @@ LA25E:   sta     $a8
          bne     @LA260
          rts
 
+; Draw source square, then destination square if present.
+draw_selected_square_piece_pair:
 LA270:   jsr     LA25C
          clc
          lda     $ab
@@ -409,6 +479,8 @@ LA270:   jsr     LA25C
          jsr     LA25C
 @LA295:  rts
 
+; Draw one piece sprite with orientation/color adjustments.
+draw_piece_with_color_and_orientation:
 LA296:   lda     $aa
          and     #$bf
          sta     $a7
@@ -448,6 +520,8 @@ LA296:   lda     $aa
 @LA2D7:  jsr     LA38A
          rts
 
+; Convert internal piece code to sprite index format.
+remap_piece_code_for_font:
 LA2DB:   lda     $aa
          rol     A
          php
@@ -468,6 +542,8 @@ LA2DB:   lda     $aa
          .byte   $0a
          .byte   $0c
 
+; Convert from/to board indices to on-screen coordinates.
+load_from_to_screen_coords:
 LA2F2:   lda     $07
          jsr     LA311
          lda     $033c
@@ -482,6 +558,8 @@ LA2F2:   lda     $07
          sta     $ae
          rts
 
+; Convert board index in A into file/rank display chars in $033c/$033d.
+board_index_to_screen_xy:
 LA311:   ldx     #$01
          jsr     LAB47
          dec     $033c
@@ -494,6 +572,8 @@ LA311:   ldx     #$01
          sta     $033d
          rts
 
+; Redraw the piece located at board index in $08.
+redraw_square_from_board:
 LA32B:   ldx     $08
          lda     $146e,x
          sta     $aa
@@ -502,6 +582,8 @@ LA32B:   ldx     $08
          jsr     LA270
          rts
 
+; Convert file/rank chars in $ab/$ac to screen and color pointers.
+calc_screen_ptr_from_xy:
 LA33C:   lda     #$00
          sta     $a3
          sta     $a4
@@ -528,6 +610,7 @@ LA33C:   lda     #$00
          ldx     #$02
          rts
 
+calc_color_ptr_from_screen_ptr:
 LA36B:   lda     $a3
          sta     $f7
          clc
@@ -536,6 +619,7 @@ LA36B:   lda     $a3
          sta     $f8
          rts
 
+add_to_screen_ptr:
 LA377:   pha
          clc
          adc     $a3
@@ -546,8 +630,10 @@ LA377:   pha
          pla
          rts
 
+draw_piece_at_screen_ptr_default:
 LA386:   lda     #$01
          sta     $a5
+draw_piece_at_screen_ptr:
 LA38A:   jsr     LA33C
          lda     $a5
          asl     A
@@ -571,6 +657,7 @@ LA38A:   jsr     LA33C
          bne     @LA395
          rts
 
+invert_square_block:
 LA3B2:   jsr     LA33C
 @LA3B5:  lda     ($a3),y
          eor     #$80
@@ -583,12 +670,15 @@ LA3B2:   jsr     LA33C
          bne     @LA3B5
          rts
 
+advance_screen_ptr_one_rank:
 LA3C7:   pha
          lda     #$16
          jsr     LA377
          pla
          rts
 
+; Full board redraw from `board_cells`.
+redraw_board_pieces:
 LA3CF:   jsr     LA009
          ldx     #$15
 @LA3D4:  lda     $146e,x
@@ -609,6 +699,8 @@ LA3CF:   jsr     LA009
 @LA3F4:  inx
          cpx     #$63
          bne     @LA3D4
+; Draw board frame, rank/file legends, and level banner.
+redraw_board_and_headers:
 LA3F9:   jsr     LA4B5
          lda     #$00
          sta     $a3
@@ -704,6 +796,7 @@ show_msg:
          bne     @LA4A5
 @LA4B4:  rts
 
+clear_status_line:
 LA4B5:   lda     #$60
          sta     $a3
          lda     #$1f
@@ -718,6 +811,8 @@ LA4B5:   lda     #$60
          bpl     @LA4C2
          rts
 
+; Initialize RAM tables used by rendering and move generation.
+init_video_ram_and_tables:
 LA4CE:   lda     #$00
          tay
          sta     $57
@@ -765,10 +860,12 @@ LA4CE:   lda     #$00
          bne     @LA51A
          rts
 
+piece_sprite_nibble_order:
 LA528:   .byte   $00,$00,$00,$00,$1d,$1e,$1b,$1c,$03,$04,$01,$02,$22,$23,$1f,$21
          .byte   $07,$08,$05,$06,$26,$27,$24,$25,$0b,$0c,$09,$0a,$2a,$2b,$28,$29
          .byte   $0f,$10,$0d,$0e,$2e,$2f,$2c,$2d,$13,$14,$11,$12,$2e,$2f,$30,$31
          .byte   $13,$14,$15,$16
+piece_sprite_bitmap_data:
 la55c:   .byte   $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff,$00,$00,$01,$03,$03,$03,$01,$0f
          .byte   $00,$00,$80,$c0,$c0,$c0,$80,$f0,$01,$01,$01,$01,$01,$03,$07,$1f
          .byte   $80,$80,$80,$80,$80,$c0,$e0,$f8,$00,$00,$33,$33,$3f,$3f,$3f,$0f
@@ -783,6 +880,7 @@ la55c:   .byte   $ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff,$00,$00,$01,$03,$03,$03,$01,$0f
          .byte   $80,$80,$e0,$e0,$80,$c0,$e0,$e0,$3c,$72,$70,$3c,$0e,$4e,$3c,$00
          .byte   $7e,$4e,$4e,$7e,$4e,$4e,$4e,$00,$7c,$72,$72,$7c,$4e,$4e,$4e,$00
          .byte   $7e,$4e,$40,$5e,$4e,$4e,$7e,$00
+engine_lookup_tables:
 la634:   .byte   $ff,$fe,$fd,$fb,$fb,$fb,$e1,$ef,$ff,$7f,$bf,$df,$df,$df,$87,$f7
          .byte   $e1,$fd,$fd,$fd,$f9,$f3,$c7,$df,$87,$bf,$bf,$bf,$9f,$cf,$e3,$fb
          .byte   $ff,$ff,$8c,$b3,$b3,$bf,$bf,$bf,$ff,$ff,$ff,$ff,$ff,$ff,$ff,$ff
@@ -944,8 +1042,9 @@ start:
          jsr     b_init_ram     ; 3
 ;--- END OF PATCH ---
 
-         jsr     LA4CE
-         jsr     LAAAB
+         jsr     init_video_ram_and_tables
+         jsr     init_board_start_position
+reset_game_state:
 LA911:   sei
          ldx     #$ff
          txs
@@ -963,9 +1062,9 @@ LA911:   sei
          lda     #$05
          sta     $20
          jsr     @welcome
-         jsr     LA3CF
-         jsr     LA07E
-         jsr     LACCC
+         jsr     redraw_board_pieces
+         jsr     flash_input_panel
+         jsr     show_move_number
 @LA93B:  lda     next_color
          cmp     human_color
          bne     @LA94C
@@ -992,7 +1091,7 @@ LA911:   sei
 @LA967:  rts
 
 @welcome:
-         jsr     LA00E
+         jsr     reset_input_panel_and_cursor
          ldx     #<lwelcome_msg
          ldy     #>lwelcome_msg
          jsr     input_string
@@ -1005,7 +1104,7 @@ LA911:   sei
          jsr     @screen_x_offset
          jmp     @LA972
 
-@LA986:  jsr     LA011
+@LA986:  jsr     set_input_cursor
          ldx     #<ladapted
          ldy     #>ladapted
          jsr     $ad27
@@ -1061,7 +1160,7 @@ LA911:   sei
          sta     $900f
 @LA9E3:  rts
 
-@LA9E4:  jsr     LA019
+@LA9E4:  jsr     clear_board_display_area
          ldx     #<lgame_or_setup
          ldy     #>lgame_or_setup
          jsr     input
@@ -1069,8 +1168,8 @@ LA911:   sei
          beq     @LA9F5
          jmp     @LAA65
 
-@LA9F5:  jsr     LABCE
-         jsr     LA019
+@LA9F5:  jsr     setup_position_editor
+         jsr     clear_board_display_area
 @LA9FB:  ldx     #<lnextcolor
          ldy     #>lnextcolor
          jsr     input
@@ -1121,7 +1220,7 @@ LA911:   sei
          sta     move_number
          jmp     @LAA72
 
-@LAA55:  jsr     LA10C
+@LAA55:  jsr     wait_for_key
          cmp     #$0d
          beq     @LAA64
          cmp     #$30
@@ -1135,7 +1234,7 @@ LA911:   sei
          sta     $1c
          lda     #$01
          sta     move_number
-         jsr     LAAAB
+         jsr     init_board_start_position
 @LAA72:  ldx     #<lchoose_color
          ldy     #>lchoose_color
          jsr     input
@@ -1162,8 +1261,11 @@ LA911:   sei
          bpl     @LAA9E
          lda     #$01
          sta     next_color+1
-         jmp     LBCE4
+         jmp     recompute_material_and_phase
 
+; Install initial piece placement and clear per-piece flags.
+INITBD:
+init_board_start_position:
 LAAAB:   ldx     #$77
          lda     #$ff
 @LAAAF:  sta     $146e,x
@@ -1189,8 +1291,9 @@ LAAAB:   ldx     #$77
          bne     @LAAB9
          rts
 
+CPTRMV:
 sargon_moves:
-         jsr     LA3F9
+         jsr     redraw_board_and_headers
          lda     #$02
          sta     $97a7
          jsr     calc_move
@@ -1199,12 +1302,12 @@ sargon_moves:
          lda     scoreL_stack
          cmp     #$01
          beq     @mate0
-@LAAF6:  jsr     LAD76
+@LAAF6:  jsr     detect_draw_or_repetition
          bcs     @stalemate
-         jsr     LAD54
+         jsr     push_recent_move_history
          ldx     #$b4
-         jsr     LA161
-         jsr     LAC32
+         jsr     beep_and_delay
+         jsr     update_last_move_display
          lda     scoreH_stack
          cmp     #$ff
          bne     @LAB23
@@ -1234,11 +1337,13 @@ sargon_moves:
          ldy     #>lmate
          jsr     show_msg
 @LAB3B:  ldx     #$c8
-         jsr     LA161
+         jsr     beep_and_delay
          cli
-         jsr     LA10C
-         jmp     LA911
+         jsr     wait_for_key
+         jmp     reset_game_state
 
+; Convert board index in A into "<file><rank>" chars at $033c,X.
+board_index_to_file_rank_chars:
 LAB47:   tay
          lda     #$2f
          sta     $033c,x
@@ -1254,6 +1359,8 @@ LAB47:   tay
          sta     $033c,x
          rts
 
+; Parse "<file><rank>" chars from $033c,X and store board index at $07,X.
+parse_file_rank_chars:
 LAB61:   lda     $033c,x
          and     #$7f
          cmp     #$31
@@ -1287,44 +1394,48 @@ LAB61:   lda     $033c,x
 @LAB98:  sec
          rts
 
+PLYRMV:
 human_moves:
          lda     #$01
          sta     $8e
          lda     #$10
          sta     $8f
-         jsr     LAEC0
+         jsr     generate_legal_moves_for_side
 @LABA5:  jsr     LA0A6
          ldx     #$04
 @LABAA:  jsr     LAB61
          bcs     @LABBF
          bpl     @LABAA
-         jsr     LADDA
+         jsr     find_move_index_in_list
          bcs     @LABBF
-         jsr     LAD54
-         jsr     LA3F9
-         jmp     LAC32
+         jsr     push_recent_move_history
+         jsr     redraw_board_and_headers
+         jmp     update_last_move_display
 
 @LABBF:  ldx     #<linvalid_move
          ldy     #>linvalid_move
          jsr     show_msg
          ldx     #$aa
-         jsr     LA161
+         jsr     beep_and_delay
          jmp     @LABA5
 
-LABCE:   jsr     LA10C
-         jsr     LA3CF
+; Manual setup editor (board cursor + piece placement).
+ANALYS:
+setup_position_editor:
+LABCE:   jsr     wait_for_key
+         jsr     redraw_board_pieces
          ldx     #$15
 @LABD6:  stx     $07
-@LABD8:  jsr     LA210
+@LABD8:  jsr     preview_square_piece
          jsr     k_getchar
          beq     @LABD8
          cmp     #$0d
          bne     @LABEB
-         jsr     LBCE4
-         jsr     LA009
+         jsr     recompute_material_and_phase
+         jsr     screen_clear_and_home
          rts
 
-@LABEB:  jsr     LA225
+@LABEB:  jsr     move_board_cursor
          cpy     #$ff
          bne     @LABD6
          ldx     #$06
@@ -1335,7 +1446,7 @@ LABCE:   jsr     LA10C
          txa
          beq     @LAC20
 @LABFF:  stx     $aa
-         jsr     LA10C
+         jsr     wait_for_key
          ldy     #$00
          cmp     #$57
          beq     @LAC0C
@@ -1343,7 +1454,7 @@ LABCE:   jsr     LA10C
 @LAC0C:  tya
          ora     $aa
          sta     $aa
-         jsr     LA10C
+         jsr     wait_for_key
          ldy     $aa
          and     #$01
          lsr     A
@@ -1355,17 +1466,19 @@ LABCE:   jsr     LA10C
 @LAC20:  ldx     $07
          sta     $146e,x
          sta     $aa
-         jsr     LA2DB
-         jsr     LA296
+         jsr     remap_piece_code_for_font
+         jsr     draw_piece_with_color_and_orientation
          ldx     $07
          jmp     @LABD8
 
-LAC32:   jsr     LACB6
+; Commit move UI update and repaint source/destination squares.
+update_last_move_display:
+LAC32:   jsr     show_last_move_and_check
          lda     $0b
          sta     $07
          lda     $0c
          sta     $08
-         jsr     LA32B
+         jsr     redraw_square_from_board
          bit     $1332
          bmi     @LAC56
          bvc     LACB5
@@ -1390,17 +1503,19 @@ LAC32:   jsr     LACB6
 @LAC68:  clc
          adc     $07
 @LAC6B:  sta     $07
-         jmp     LA32B
+         jmp     redraw_square_from_board
 
+; Build human-readable move text (normal/capture/castle).
+format_last_move_text:
 LAC70:   bit     $1332
          bmi     @LAC9D
          bvs     @LAC97
          ldx     #$01
          lda     $0b
-         jsr     LAB47
+         jsr     board_index_to_file_rank_chars
          ldx     #$04
          lda     $0c
-         jsr     LAB47
+         jsr     board_index_to_file_rank_chars
          ldx     #$2d
          lda     $1328
          beq     @LAC8E
@@ -1427,18 +1542,22 @@ LAC70:   bit     $1332
          ldy     #>loo
 @LACB0:  lda     #$00
          sta     $0341
+no_check_msg:
 LACB5:   rts
 
-LACB6:   jsr     LAC70
-         jsr     LA09B
+show_last_move_and_check:
+LACB6:   jsr     format_last_move_text
+         jsr     render_prompt_and_reset_input
+show_check_if_any:
 LACBC:   lda     next_color
          eor     #$80
-         jsr     LBBD3
+         jsr     king_in_check_for_color
          bcc     LACB5
          ldx     #<lcheck
          ldy     #>lcheck
          jmp     show_msg
 
+show_move_number:
 LACCC:   ldx     #$30
          lda     move_number
 @LACD0:  cmp     #$0a
@@ -1461,26 +1580,28 @@ LACCC:   ldx     #$30
          sta     $033e
          ldx     #$3c
          ldy     #$03
-         jmp     LA09B
+         jmp     render_prompt_and_reset_input
 
-LACFA:   jsr     LA06E
+refresh_last_move_panel:
+LACFA:   jsr     clear_input_cells
          lda     #$00
          sta     $f9
          sta     $00
-         jsr     LAC70
-         jsr     LAD12
+         jsr     format_last_move_text
+         jsr     print_string_in_input_cells
          lda     #$00
          sta     $f9
          sta     $00
-         jmp     LACBC
+         jmp     show_check_if_any
 
+print_string_in_input_cells:
 LAD12:   stx     $05
          sty     $06
          ldy     #$00
 @LAD18:  lda     ($05),y
          beq     @LAD26
          sty     $a3
-         jsr     LA08A
+         jsr     push_input_char
          ldy     $a3
          iny
          bne     @LAD18
@@ -1497,6 +1618,8 @@ input_string:
          bne     @LAD2D
 @LAD37:  rts
 
+; '?' hotkey: undo currently explored move when possible.
+handle_takeback_hotkey:
 LAD38:   ldy     level+1
          cpy     #$02
          bcc     @LAD51
@@ -1504,12 +1627,14 @@ LAD38:   ldy     level+1
          sta     $07
          lda     $b4
          sta     $0a
-         jsr     LADDA
+         jsr     find_move_index_in_list
          bcs     @LAD51
-         jsr     LB8C7
-         jsr     LACFA
-@LAD51:  jmp     LA0F6
+         jsr     unmake_move
+         jsr     refresh_last_move_panel
+@LAD51:  jmp     poll_keyboard_or_joystick
 
+; Keep recent moves/history for repetition detection and UI.
+push_recent_move_history:
 LAD54:   ldx     #$17
 @LAD56:  lda     $12fe,x
          sta     $1302,x
@@ -1525,6 +1650,8 @@ LAD54:   ldx     #$17
          sta     $1301
          rts
 
+; Detect draw/repetition-like cycles used by game flow.
+detect_draw_or_repetition:
 LAD76:   lda     $6a
          bit     human_color
          bmi     @LAD81
@@ -1549,9 +1676,9 @@ LAD76:   lda     $6a
          bne     @LADD4
          lda     #$02
          sta     $8d
-         jsr     LADF2
+         jsr     make_and_validate_selected_move
          bcs     @LADD4
-         jsr     LB3AF
+         jsr     evaluate_position
          lda     $1328
          and     #$07
          tax
@@ -1567,16 +1694,18 @@ LAD76:   lda     $6a
          clc
          rts
 
-@LADD1:  jsr     LB8C7
+@LADD1:  jsr     unmake_move
 @LADD4:  lda     #$00
          sta     $8d
-         beq     LADF2
+         beq     make_and_validate_selected_move
 
+; Find move index in current move list by from/to squares.
+find_move_index_in_list:
 LADDA:   ldx     #$fe
 @LADDC:  inx
          inx
          lda     $1001,x
-         beq     LADFD
+         beq     selected_move_invalid
          cmp     $07
          bne     @LADDC
          lda     $1002,x
@@ -1584,13 +1713,19 @@ LADDA:   ldx     #$fe
          bne     @LADDC
          stx     $9c
          stx     $8d
-LADF2:   jsr     LB7C4
-         jsr     LBBD1
-         bcc     LADFE
-         jsr     LB8C7
+make_and_validate_selected_move:
+LADF2:   jsr     make_move
+         jsr     king_in_check_for_side_to_move
+         bcc     selected_move_valid
+         jsr     unmake_move
+selected_move_invalid:
 LADFD:   sec
+selected_move_valid:
 LADFE:   rts
 
+; Generate pseudo-legal moves for piece in $13 from square $07.
+MPIECE:
+generate_moves_for_piece:
 LADFF:   ldx     $0d
          lda     la634+235,x
          sta     $10
@@ -1621,7 +1756,7 @@ LADFF:   ldx     $0d
          lda     $0d
          cmp     #$01
          beq     @LAE53
-         jsr     LAE79
+         jsr     append_move_pair
          lda     $0e
          bne     @LAE4C
          lda     $0d
@@ -1639,7 +1774,7 @@ LADFF:   ldx     $0d
          bcs     @LAE69
          lda     $0e
          bne     @LAE68
-         jsr     LAE79
+         jsr     append_move_pair
          bit     $13
          bvs     @LAE68
          dec     $10
@@ -1648,12 +1783,14 @@ LADFF:   ldx     $0d
 
 @LAE69:  lda     $0e
          beq     @LAE73
-         jsr     LAE79
+         jsr     append_move_pair
          jmp     @LAE4C
 
-@LAE73:  jsr     LAE83
+@LAE73:  jsr     ENPSNT
          jmp     @LAE4C
 
+ADMOVE:
+append_move_pair:
 LAE79:   lda     $07
          sta     ($8b),y
          iny
@@ -1662,6 +1799,9 @@ LAE79:   lda     $07
          iny
          rts
 
+; Pawn-specific extra generation: en passant candidate handling.
+ENPSNT:
+append_en_passant_if_legal:
 LAE83:   lda     $07
          bit     $13
          bpl     @LAE8C
@@ -1692,10 +1832,13 @@ LAE83:   lda     $07
          beq     @LAEBC
          cmp     #$f6
          bne     @LAEBF
-@LAEBC:  jmp     LAE79
+@LAEBC:  jmp     append_move_pair
 
 @LAEBF:  rts
 
+; Build move list for `next_color`, including castling.
+MOVGEN:
+generate_legal_moves_for_side:
 LAEC0:   ldy     next_color+1
          lda     $8e
          sta     $1459,y
@@ -1707,7 +1850,7 @@ LAEC0:   ldy     next_color+1
          sta     $133b,y
          sta     $8d
          tay
-         jsr     @LAF13
+         jsr     CASTLE
          ldx     #$15
          stx     $07
 @LAEDF:  lda     $146e,x
@@ -1720,7 +1863,7 @@ LAEC0:   ldy     next_color+1
          sta     $13
          and     #$07
          sta     $0d
-         jsr     LADFF
+         jsr     generate_moves_for_piece
 @LAEF7:  inc     $07
          ldx     $07
          cpx     #$63
@@ -1738,6 +1881,7 @@ LAEC0:   ldy     next_color+1
          sta     $8f
          rts
 
+CASTLE:
 @LAF13:  ldx     $6c
          lda     next_color
          bpl     @LAF1B
@@ -1748,7 +1892,7 @@ LAEC0:   ldy     next_color+1
          lda     $146e,x
          sta     $13
          stx     $07
-         jsr     LAF7A
+         jsr     is_square_attacked
          bcs     @LAF79
          lda     #$02
          sta     $12
@@ -1771,7 +1915,7 @@ LAEC0:   ldy     next_color+1
          lda     $12
          cmp     #$03
          beq     @LAF5A
-         jsr     LAF7A
+         jsr     is_square_attacked
          bcs     @LAF66
 @LAF5A:  dec     $12
          bne     @LAF45
@@ -1779,7 +1923,7 @@ LAEC0:   ldy     next_color+1
          sec
          sbc     $09
          tax
-         jsr     LAE79
+         jsr     append_move_pair
 @LAF66:  lda     $09
          bpl     @LAF79
          ldx     $07
@@ -1792,6 +1936,9 @@ LAEC0:   ldy     next_color+1
 
 @LAF79:  rts
 
+; Return carry set if square X is attacked by opposite color in $13.
+ATTACK:
+is_square_attacked:
 LAF7A:   stx     $08
          lda     #$10
          sta     $10
@@ -1874,6 +2021,8 @@ LAF7A:   stx     $08
          bne     @LAFA9
          beq     @LAFB2
 
+; Build attack/capture relation lists used by SEE and eval.
+build_attack_exchange_lists:
 LB00F:   lda     #$00
          sta     $6f
          lda     #$7f
@@ -2052,6 +2201,7 @@ LB00F:   lda     #$00
          sta     $12
          jmp     @LB05E
 
+prune_exchange_lists:
 LB162:   lda     $6e
          eor     #$ff
          clc
@@ -2190,6 +2340,7 @@ LB162:   lda     $6e
          ldy     $11
          jmp     @LB174
 
+bucket_attackers_by_value:
 LB278:   lda     $0a
          sta     $10
          ldx     #$0e
@@ -2266,6 +2417,7 @@ LB278:   lda     $0a
 
 @LB304:  rts
 
+static_exchange_eval:
 LB305:   ldx     $08
          lda     $146e,x
          sta     $13
@@ -2362,6 +2514,8 @@ LB305:   ldx     $08
          clc
 @LB3AE:  rts
 
+POINTS:
+evaluate_position:
 LB3AF:   inc     $70
          bne     @LB3BB
          inc     $71
@@ -2373,8 +2527,8 @@ LB3AF:   inc     $70
 @LB3BF:  sta     $61,x
          dex
          bpl     @LB3BF
-         jsr     LB00F
-         jsr     LB162
+         jsr     build_attack_exchange_lists
+         jsr     prune_exchange_lists
          lda     $6e
          eor     #$ff
          clc
@@ -2387,8 +2541,8 @@ LB3AF:   inc     $70
          beq     @LB42A
          sta     $08
          sty     $09
-         jsr     LB278
-         jsr     LB305
+         jsr     bucket_attackers_by_value
+         jsr     static_exchange_eval
          sec
          sbc     #$80
          bmi     @LB428
@@ -2434,7 +2588,7 @@ LB3AF:   inc     $70
          sta     $65
 @LB437:  lda     level+2
          beq     @LB43E
-         jsr     LB75C
+         jsr     eval_king_distance_pressure
 @LB43E:  jsr     @LB4C2
          lda     $65
          asl     $63
@@ -2711,6 +2865,7 @@ LB3AF:   inc     $70
 
 @LB643:  jmp     @LB4D2
 
+eval_piece_square_bonus:
 LB646:   lda     $13
          and     #$07
          cmp     #$01
@@ -2870,6 +3025,7 @@ LB646:   lda     $13
          sta     $1e
          rts
 
+eval_king_distance_pressure:
 LB75C:   lda     $6c
          ldy     #$00
 @LB760:  cmp     #$0a
@@ -2932,6 +3088,9 @@ LB75C:   lda     $6c
          sta     $64
          rts
 
+; Apply move at list index $8d; updates board and incremental eval.
+MOVE:
+make_move:
 LB7C4:   ldy     $8d
          lda     ($8b),y
          sta     $0b
@@ -2963,7 +3122,7 @@ LB7C4:   ldy     $8d
          bne     @LB803
          jmp     @LB883
 
-@LB803:  jsr     LB646
+@LB803:  jsr     eval_piece_square_bonus
          ldy     next_color+1
          lda     $0d
          sta     $1331,y
@@ -3067,6 +3226,9 @@ LB7C4:   ldy     $8d
          sta     $0d
 @LB8C4:  jmp     @LB803
 
+; Undo move at list index $8d.
+UNMOVE:
+unmake_move:
 LB8C7:   ldy     $8d
          lda     ($8b),y
          sta     $0b
@@ -3099,7 +3261,7 @@ LB8C7:   ldy     $8d
          and     #$20
          bne     @LB92A
 @LB908:  inc     $0d
-         jsr     LB646
+         jsr     eval_piece_square_bonus
          lda     $14
          beq     @LB929
          and     #$07
@@ -3183,6 +3345,9 @@ LB8C7:   ldy     $8d
          sta     $146e,x
          jmp     @LB908
 
+; Move ordering by captured piece / tactical hints.
+SORTM:
+order_move_list:
 LB9A5:   ldy     next_color+1
          lda     $1445,y
          sta     $07
@@ -3255,27 +3420,29 @@ LB9A5:   ldy     next_color+1
          inc     $11
 @LBA24:  rts
 
+; Main alpha-beta search over generated move lists.
+search_alpha_beta:
 LBA25:   ldy     $8d
          lda     ($8b),y
          beq     @LBA45
-         jsr     LADF2
+         jsr     make_and_validate_selected_move
          bcc     @LBA33
          jmp     @LBADC
 
 @LBA33:  ldy     next_color+1
          cpy     level+1
          bcs     @LBA88
-@LBA39:  jsr     @LBAEB
-         jsr     LAEC0
-         jsr     LB9A5
-         jmp     LBA25
+@LBA39:  jsr     ASCEND_PUSH
+         jsr     generate_legal_moves_for_side
+         jsr     order_move_list
+         jmp     search_alpha_beta
 
 @LBA45:  lda     $1d
          bne     @LBA68
          dey
          dey
          sty     $8d
-         jsr     LBBD1
+         jsr     king_in_check_for_side_to_move
          bcc     @LBA5D
          lda     next_color+1
          sta     $61
@@ -3294,7 +3461,7 @@ LBA25:   ldy     $8d
          bne     @LBA6F
          rts
 
-@LBA6F:  jsr     @LBB06
+@LBA6F:  jsr     ASCEND_POP
          lda     scoreL_stack,y
          eor     #$ff
          clc
@@ -3306,7 +3473,7 @@ LBA25:   ldy     $8d
          sta     $62
          jmp     @LBA9E
 
-@LBA88:  jsr     LBB86
+@LBA88:  jsr     EVAL
          lda     next_color+1
          cmp     level
          bcc     @LBA99
@@ -3314,7 +3481,7 @@ LBA25:   ldy     $8d
          bne     @LBA99
          lda     $69
          bne     @LBA39
-@LBA99:  jsr     LB8C7
+@LBA99:  jsr     unmake_move
 @LBA9C:  inc     $1d
 @LBA9E:  ldy     next_color+1
          lda     $62
@@ -3328,7 +3495,7 @@ LBA25:   ldy     $8d
          sta     $0022,y
          lda     $62
          sta     $002f,y
-         jsr     LBB41
+         jsr     update_best_line
          lda     $61
          eor     #$ff
          clc
@@ -3350,8 +3517,9 @@ LBA25:   ldy     $8d
          adc     #$02
          sta     $133b,y
          sta     $8d
-         jmp     LBA25
+         jmp     search_alpha_beta
 
+ASCEND_PUSH:
 @LBAEB:  lda     next_color
          eor     #$80
          sta     next_color
@@ -3365,6 +3533,8 @@ LBA25:   ldy     $8d
          inc     next_color+1
          rts
 
+ASCEND:
+ASCEND_POP:
 @LBB06:  lda     next_color
          eor     #$80
          sta     next_color
@@ -3382,7 +3552,7 @@ LBA25:   ldy     $8d
          sta     $8c
          lda     $133b,y
          sta     $8d
-         jsr     LB8C7
+         jsr     unmake_move
          ldy     next_color+1
          cpy     #$01
          bne     @LBB40
@@ -3392,6 +3562,7 @@ LBA25:   ldy     $8d
          sta     $1fe2
 @LBB40:  rts
 
+update_best_line:
 LBB41:   lda     $1327,y
          bne     @LBB50
          lda     $0b
@@ -3410,7 +3581,7 @@ LBB41:   lda     $1327,y
          sta     $1001
          lda     $0c
          sta     $1002
-@LBB6B:  jsr     LACFA
+@LBB6B:  jsr     refresh_last_move_panel
          ldy     next_color+1
          lda     $b5
          sta     $9f
@@ -3426,6 +3597,9 @@ LBB41:   lda     $1327,y
          sta     $b6
 @LBB85:  rts
 
+; Original Sargon `EVAL`: fast material bound with optional full `POINTS`.
+EVAL:
+eval_or_expand_node:
 LBB86:   lda     level+1
          cmp     level
          bcs     @LBBC1
@@ -3456,27 +3630,32 @@ LBB86:   lda     level+1
          lda     $0022,y
          cmp     $61
          bcs     @LBBC4
-@LBBC1:  jmp     LB3AF
+@LBBC1:  jmp     evaluate_position
 
 @LBBC4:  lda     next_color
          eor     #$80
-         jsr     LBBD3
+         jsr     king_in_check_for_color
          lda     #$00
          rol     A
          sta     $69
          rts
 
+INCHK:
+king_in_check_for_side_to_move:
 LBBD1:   lda     next_color
+INCHK_COLOR:
+king_in_check_for_color:
 LBBD3:   bmi     @LBBD8
          ldx     $6c
          .byte   $2c
 @LBBD8:  ldx     $6d
          lda     $146e,x
          sta     $13
-         jmp     LAF7A
+         jmp     is_square_attacked
 
+FNDMOV:
 calc_move:
-         jsr     LBCE4
+         jsr     recompute_material_and_phase
          lda     #$00
          sta     $1e
          sta     $70
@@ -3494,18 +3673,18 @@ calc_move:
          sta     $8f
          lda     #$01
          sta     level+1
-         jsr     LAEC0
+         jsr     generate_legal_moves_for_side
          lda     $8e
          sta     $145b
          lda     $8f
          sta     $1465
          lda     $1c
          bne     @LBC1C
-         jsr     LBF60
+         jsr     try_opening_book
 @LBC1C:  lda     level+1
          ora     #$70
          sta     $1fe3
-         jsr     LBA25
+         jsr     search_alpha_beta
          lda     scoreH_stack
          beq     @LBC2E
          cmp     #$ff
@@ -3605,6 +3784,7 @@ calc_move:
          sta     $8f
          jmp     @LBC1C
 
+recompute_material_and_phase:
 LBCE4:   lda     #$00
          sta     level+2
          sta     $6a
@@ -3665,6 +3845,9 @@ LBCE4:   lda     #$00
     .error "No openings book defined. Please define one of the USE_* flags."
 .endif
 
+; Opening-book lookup and randomized child selection.
+BOOK:
+try_opening_book:
 LBF60:   lsr     $9c
          ldy     #$00
          lda     move_number
@@ -3719,9 +3902,9 @@ LBF60:   lsr     $9c
          asl     A
          sta     $8d
          jsr     goto_child
-         jsr     LB7C4
-         jsr     LB8C7
-         jsr     LBB41
+         jsr     make_move
+         jsr     unmake_move
+         jsr     update_best_line
          lda     #$50
          sta     scoreH_stack
          lda     #$00
@@ -3759,4 +3942,3 @@ next_child:
          lda     $0f
          clc
          rts
-
