@@ -12,6 +12,8 @@ The only change is that `RESTORE` will bring you to the intro screen in addition
 
 The source file `SargonII.S` is a fully annotated disassembly: all labels, variables, and subroutines have been given descriptive names, and the code is commented throughout explaining the chess engine internals (minimax search, move generation, static exchange evaluation, opening book, VIC-20 hardware interaction). See [ANNOTATION.md](ANNOTATION.md) for details.
 
+The source is formatted with [nice65](https://github.com/jamarju/nice65) (`nice65 -c -C 41 -m SargonII.S`).
+
 ## Requirements (MacOs)
 
 Install cc65 toolchain:
