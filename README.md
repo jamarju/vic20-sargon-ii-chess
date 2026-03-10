@@ -6,6 +6,12 @@ The only change is that `RESTORE` will bring you to the intro screen in addition
 
 **NEW 2024-12-01**: An enhanced version including Sargon 2.1 CP/M version of the openings book is now also available!
 
+**NEW 2026-03-10**: The source is now a fully annotated disassembly with descriptive labels, named variables, and detailed comments. See below.
+
+## Annotated disassembly
+
+The source file `SargonII.S` is a fully annotated disassembly: all labels, variables, and subroutines have been given descriptive names, and the code is commented throughout explaining the chess engine internals (minimax search, move generation, static exchange evaluation, opening book, VIC-20 hardware interaction). See [ANNOTATION.md](ANNOTATION.md) for details.
+
 ## Requirements (MacOs)
 
 Install cc65 toolchain:
